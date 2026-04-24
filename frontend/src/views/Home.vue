@@ -312,29 +312,39 @@ const handleSubmit = async () => {
     loadingProgress.value = 100
     loadingStatus.value = '✅ 完成!'
 
-    if (response.success && response.data) {
-      // 保存到sessionStorage
-      sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
-      if (response.task_id) {
-        sessionStorage.setItem('tripTaskId', response.task_id)
-      }
-      if (response.user_id) {
-        sessionStorage.setItem('tripUserId', response.user_id)
-      }
-      if (response.update_mode) {
-        sessionStorage.setItem('tripUpdateMode', response.update_mode)
-      }
-      if (response.assistant_message) {
-        sessionStorage.setItem('tripAssistantMessage', response.assistant_message)
+    if (response.success && (response.data || response.task_id)) {
+      try {
+        if (response.data) {
+          sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
+        }
+        if (response.task_id) {
+          sessionStorage.setItem('tripTaskId', response.task_id)
+        }
+        if (response.user_id) {
+          sessionStorage.setItem('tripUserId', response.user_id)
+        }
+        if (response.update_mode) {
+          sessionStorage.setItem('tripUpdateMode', response.update_mode)
+        }
+        if (response.assistant_message) {
+          sessionStorage.setItem('tripAssistantMessage', response.assistant_message)
+        }
+      } catch (storageError) {
+        console.warn('sessionStorage cache failed, but navigation will continue:', storageError)
       }
 
-      message.success('旅行计划生成成功!')
+      message.success('????????!')
+
+      const target = response.task_id
+        ? { name: 'Result', query: { taskId: response.task_id } }
+        : { name: 'Result' }
 
       try {
-        await router.push('/result')
+        await router.push(target)
       } catch (navError) {
-        console.error('路由跳转失败,使用location兜底:', navError)
-        window.location.assign('/result')
+        console.error('route navigation failed, fallback to location:', navError)
+        const query = response.task_id ? `?taskId=${encodeURIComponent(response.task_id)}` : ''
+        window.location.assign(`/result${query}`)
       }
     } else {
       message.error(response.message || '生成失败')

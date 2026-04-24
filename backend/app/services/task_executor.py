@@ -80,7 +80,9 @@ class TripTaskExecutor:
         )
 
         retrieval_results = self._fetch_initial_context_parallel(request)
-        print(f"INFO plan_initial retrieval completed | keys={list(retrieval_results.keys())}", flush=True)
+        print("=" * 80, flush=True)
+        print(f"INFO retrieval completed | keys={list(retrieval_results.keys())}", flush=True)
+        print("=" * 80, flush=True)
         user_profile_summary = json.dumps(user_memory.get("profile", {}), ensure_ascii=False)
         print("INFO plan_initial build_plan_from_context start", flush=True)
         plan = self.planner.build_plan_from_context(
@@ -473,7 +475,7 @@ class TripTaskExecutor:
     def _build_meal_from_existing_candidates(self, plan: TripPlan, meal_type: str) -> Meal | None:
         for day in plan.days:
             for meal in day.meals:
-                if meal.name and meal.type:
+                if meal.name and meal.type == meal_type:
                     return Meal(
                         type=meal_type,
                         name=meal.name,
@@ -483,6 +485,32 @@ class TripTaskExecutor:
                         estimated_cost=meal.estimated_cost or MEAL_DEFAULTS.get(meal_type, 30),
                     )
         return None
+
+    def _build_default_meal(self, city: str, meal_type: str) -> Meal:
+        defaults = {
+            "breakfast": (
+                f"{city}当地早餐建议",
+                "建议在当地享用一份便捷早餐，轻松开启当天行程",
+            ),
+            "lunch": (
+                f"{city}当地午餐建议",
+                "建议中午在景点或商圈附近安排一顿当地风味简餐",
+            ),
+            "dinner": (
+                f"{city}当地晚餐建议",
+                "建议晚上在当地享用特色菜，为当天行程收尾",
+            ),
+        }
+        name, description = defaults.get(
+            meal_type,
+            (f"{city}用餐建议", "建议结合当日安排就近享用一餐"),
+        )
+        return Meal(
+            type=meal_type,
+            name=name,
+            description=description,
+            estimated_cost=MEAL_DEFAULTS.get(meal_type, 30),
+        )
 
     def _reflect_and_fix(self, plan: TripPlan, form_snapshot: Dict[str, Any]) -> Tuple[TripPlan, Dict[str, Any]]:
         notes = []
@@ -514,9 +542,7 @@ class TripTaskExecutor:
                             f"INFO autofill meal_default | day_index={idx} date={day.date} meal_type={meal_type} default_cost={MEAL_DEFAULTS[meal_type]}",
                             flush=True,
                         )
-                        day.meals.append(
-                            Meal(type=meal_type, name=f"{meal_type}??", description="????????????????", estimated_cost=MEAL_DEFAULTS[meal_type])
-                        )
+                        day.meals.append(self._build_default_meal(form_snapshot.get("city", ""), meal_type))
             if not day.attractions:
                 notes.append(f"day_{idx}_missing_attractions")
                 print(f"INFO autofill attractions | day_index={idx} date={day.date}", flush=True)

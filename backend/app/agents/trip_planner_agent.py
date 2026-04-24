@@ -417,7 +417,9 @@ class MultiAgentTripPlanner:
             "weather_info": [item.model_dump() for item in draft.weather_info],
             "budget": draft.budget.model_dump() if draft.budget else {},
         }
+        print("=" * 80, flush=True)
         print(f"INFO planner raw_plan | {self._preview(json.dumps(data, ensure_ascii=False), 1500)}", flush=True)
+        print("=" * 80, flush=True)
         return self._coerce_json_to_trip_plan(data, form_snapshot, candidate_context)
 
     def _coerce_json_to_trip_plan(self, data: Dict[str, Any], form_snapshot: Dict[str, Any], candidate_context: Dict[str, Any]) -> TripPlan:

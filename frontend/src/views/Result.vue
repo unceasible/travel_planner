@@ -387,7 +387,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { DownOutlined } from '@ant-design/icons-vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
@@ -397,6 +397,7 @@ import { chatWithTrip, getTripTask } from '@/services/api'
 import type { TripPlan } from '@/types'
 
 const router = useRouter()
+const route = useRoute()
 const tripPlan = ref<TripPlan | null>(null)
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
@@ -412,7 +413,7 @@ const chatHistory = ref<Array<{ role: 'user' | 'assistant'; content: string }>>(
 let map: any = null
 
 onMounted(async () => {
-  taskId.value = sessionStorage.getItem('tripTaskId') || ''
+  taskId.value = String(route.query.taskId || sessionStorage.getItem('tripTaskId') || '')
   userId.value = sessionStorage.getItem('tripUserId') || ''
   updateMode.value = sessionStorage.getItem('tripUpdateMode') || ''
   const assistantMessage = sessionStorage.getItem('tripAssistantMessage') || ''

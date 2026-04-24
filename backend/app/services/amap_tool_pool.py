@@ -38,6 +38,9 @@ FOOD_FALLBACK_KEYWORDS = [
     "\u7f8e\u98df",
     "\u7279\u8272\u83dc",
     "\u672c\u5730\u5c0f\u5403",
+    "\u9910\u9986",
+    "\u519c\u5bb6\u83dc",
+    "\u519c\u5bb6\u9662",
 ]
 
 
