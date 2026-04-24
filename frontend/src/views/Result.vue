@@ -249,8 +249,8 @@
                   :key="meal.type"
                   :label="getMealLabel(meal.type)"
                 >
-                  {{ meal.name }}
-                  <span v-if="meal.description"> - {{ meal.description }}</span>
+                  {{ formatMealName(meal) }}
+                  <span v-if="formatMealDescription(meal)"> - {{ formatMealDescription(meal) }}</span>
                   <span style="margin-left: 8px; color: #1890ff;">¥{{ meal.estimated_cost || 0 }}</span>
                 </a-descriptions-item>
               </a-descriptions>
@@ -571,6 +571,34 @@ const moveAttraction = (dayIndex: number, attrIndex: number, direction: 'up' | '
   } else if (direction === 'down' && attrIndex < attractions.length - 1) {
     [attractions[attrIndex], attractions[attrIndex + 1]] = [attractions[attrIndex + 1], attractions[attrIndex]]
   }
+}
+
+const formatMealName = (meal: any): string => {
+  const fallback: Record<string, string> = {
+    breakfast: '????',
+    lunch: '????',
+    dinner: '????',
+    snack: '????'
+  }
+  const name = (meal?.name || '').trim()
+  if (!name || /^(breakfast|lunch|dinner|snack)??$/i.test(name)) {
+    return fallback[meal?.type] || '????'
+  }
+  return name
+}
+
+const formatMealDescription = (meal: any): string => {
+  const description = (meal?.description || '').trim()
+  if (!description || description === '????' || description === '????????????????') {
+    const fallback: Record<string, string> = {
+      breakfast: '???????????????',
+      lunch: '?????????????',
+      dinner: '???????????????',
+      snack: '?????????????'
+    }
+    return fallback[meal?.type] || '????????????'
+  }
+  return description
 }
 
 const getMealLabel = (type: string): string => {

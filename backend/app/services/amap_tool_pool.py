@@ -34,6 +34,11 @@ TYPE_SHOPPING = "\u8d2d\u7269\u670d\u52a1"
 DEFAULT_ATTRACTION = "\u666f\u70b9"
 DEFAULT_HOTEL = "\u9152\u5e97"
 DEFAULT_FOOD = "\u7f8e\u98df"
+FOOD_FALLBACK_KEYWORDS = [
+    "\u7f8e\u98df",
+    "\u7279\u8272\u83dc",
+    "\u672c\u5730\u5c0f\u5403",
+]
 
 
 def _split_location(value: str) -> Dict[str, float]:
@@ -80,7 +85,27 @@ class _AmapWorker:
     def _search_restaurants(self, query: str) -> str:
         city = self._extract_between(query, SEARCH_PREFIX, POSSESSIVE) or self._extract_city_after_prefix(query, SEARCH_PREFIX)
         keyword = self._extract_between(query, POSSESSIVE, FULL_STOP) or self._extract_after(query, POSSESSIVE)
-        return self._search_poi(city=city, keyword=(keyword or DEFAULT_FOOD).strip(), types=[TYPE_RESTAURANT, TYPE_SHOPPING])
+        primary_keyword = (keyword or DEFAULT_FOOD).strip()
+        generic_keywords = [DEFAULT_FOOD] + FOOD_FALLBACK_KEYWORDS
+        search_keywords: List[str] = []
+        for item in [primary_keyword] + generic_keywords:
+            item = item.strip()
+            if item and item not in search_keywords:
+                search_keywords.append(item)
+        for search_keyword in search_keywords:
+            result_text = self._search_poi(city=city, keyword=search_keyword, types=[TYPE_RESTAURANT, TYPE_SHOPPING])
+            try:
+                result_data = json.loads(result_text)
+            except Exception:
+                result_data = {}
+            if result_data.get("pois"):
+                if search_keyword != primary_keyword:
+                    print(
+                        f"INFO restaurant search fallback hit | city={city} primary_keyword={primary_keyword} fallback_keyword={search_keyword}",
+                        flush=True,
+                    )
+                return result_text
+        return json.dumps({"pois": []}, ensure_ascii=False)
 
     def _get_weather(self, query: str) -> str:
         city = self._extract_between(query, QUERY_PREFIX, WEATHER_AT) or self._extract_between(query, QUERY_PREFIX, WEATHER_DAYS)

@@ -52,11 +52,25 @@ Few-shot output example:
       ],
       "meals": [
         {
-          "source_candidate_id": "restaurant_0_demo",
-          "description": "??????",
+          "source_candidate_id": "restaurant_breakfast_demo",
+          "description": "?????????????",
+          "visit_duration": 45,
+          "estimated_cost": 25,
+          "type": "breakfast"
+        },
+        {
+          "source_candidate_id": "restaurant_lunch_demo",
+          "description": "?????????????",
           "visit_duration": 60,
           "estimated_cost": 60,
           "type": "lunch"
+        },
+        {
+          "source_candidate_id": "restaurant_dinner_demo",
+          "description": "????????????????",
+          "visit_duration": 75,
+          "estimated_cost": 90,
+          "type": "dinner"
         }
       ]
     }
@@ -76,9 +90,9 @@ Few-shot output example:
   "budget": {
     "total_attractions": 50,
     "total_hotels": 320,
-    "total_meals": 60,
+    "total_meals": 175,
     "total_transportation": 30,
-    "total": 460
+    "total": 575
   }
 }
 """
@@ -300,9 +314,9 @@ class MultiAgentTripPlanner:
                         )
                     ],
                     meals=[
-                        Meal(type="breakfast", name="早餐推荐", description="当地特色早餐", estimated_cost=25),
-                        Meal(type="lunch", name="午餐推荐", description="当地特色午餐", estimated_cost=60),
-                        Meal(type="dinner", name="晚餐推荐", description="当地特色晚餐", estimated_cost=90),
+                        Meal(type="breakfast", name=f"{city}????{idx + 1}", description="?????????????", estimated_cost=25),
+                        Meal(type="lunch", name=f"{city}????{idx + 1}", description="???????????????", estimated_cost=60),
+                        Meal(type="dinner", name=f"{city}????{idx + 1}", description="???????????????", estimated_cost=90),
                     ],
                 )
             )
@@ -403,6 +417,7 @@ class MultiAgentTripPlanner:
             "weather_info": [item.model_dump() for item in draft.weather_info],
             "budget": draft.budget.model_dump() if draft.budget else {},
         }
+        print(f"INFO planner raw_plan | {self._preview(json.dumps(data, ensure_ascii=False), 1500)}", flush=True)
         return self._coerce_json_to_trip_plan(data, form_snapshot, candidate_context)
 
     def _coerce_json_to_trip_plan(self, data: Dict[str, Any], form_snapshot: Dict[str, Any], candidate_context: Dict[str, Any]) -> TripPlan:

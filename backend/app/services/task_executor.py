@@ -433,8 +433,16 @@ class TripTaskExecutor:
         for day in plan.days:
             for meal in day.meals:
                 if meal.estimated_cost <= 0:
+                    print(
+                        f"INFO autofill meal_cost | date={day.date} meal_type={meal.type} meal_name={meal.name} default_cost={MEAL_DEFAULTS.get(meal.type, 30)}",
+                        flush=True,
+                    )
                     meal.estimated_cost = MEAL_DEFAULTS.get(meal.type, 30)
             if day.hotel and day.hotel.estimated_cost <= 0:
+                print(
+                    f"INFO autofill hotel_cost | date={day.date} hotel_name={day.hotel.name} accommodation={accommodation} default_cost={HOTEL_DEFAULTS.get(accommodation, 500)}",
+                    flush=True,
+                )
                 day.hotel.estimated_cost = HOTEL_DEFAULTS.get(accommodation, 500)
 
             attractions_cost = sum(max(item.ticket_price, 0) for item in day.attractions)
@@ -462,11 +470,26 @@ class TripTaskExecutor:
         )
         return plan
 
+    def _build_meal_from_existing_candidates(self, plan: TripPlan, meal_type: str) -> Meal | None:
+        for day in plan.days:
+            for meal in day.meals:
+                if meal.name and meal.type:
+                    return Meal(
+                        type=meal_type,
+                        name=meal.name,
+                        address=meal.address,
+                        location=meal.location,
+                        description=meal.description or "结合已有餐饮候选补充的用餐建议",
+                        estimated_cost=meal.estimated_cost or MEAL_DEFAULTS.get(meal_type, 30),
+                    )
+        return None
+
     def _reflect_and_fix(self, plan: TripPlan, form_snapshot: Dict[str, Any]) -> Tuple[TripPlan, Dict[str, Any]]:
         notes = []
         expected_days = int(form_snapshot.get("travel_days", len(plan.days) or 1) or 1)
         if len(plan.days) != expected_days:
             notes.append("day_count_mismatch")
+            print(f"INFO autofill day_count | existing={len(plan.days)} expected={expected_days}", flush=True)
             fallback = self.planner.create_fallback_plan(form_snapshot)
             plan.days = (plan.days + fallback.days)[:expected_days]
 
@@ -479,15 +502,32 @@ class TripTaskExecutor:
             for meal_type in ("breakfast", "lunch", "dinner"):
                 if meal_type not in meal_types:
                     notes.append(f"day_{idx}_missing_{meal_type}")
-                    day.meals.append(
-                        Meal(type=meal_type, name=f"{meal_type}推荐", description="自动补齐", estimated_cost=MEAL_DEFAULTS[meal_type])
-                    )
+                    candidate_meal = self._build_meal_from_existing_candidates(plan, meal_type)
+                    if candidate_meal is not None:
+                        print(
+                            f"INFO autofill meal_from_candidate | day_index={idx} date={day.date} meal_type={meal_type} meal_name={candidate_meal.name}",
+                            flush=True,
+                        )
+                        day.meals.append(candidate_meal)
+                    else:
+                        print(
+                            f"INFO autofill meal_default | day_index={idx} date={day.date} meal_type={meal_type} default_cost={MEAL_DEFAULTS[meal_type]}",
+                            flush=True,
+                        )
+                        day.meals.append(
+                            Meal(type=meal_type, name=f"{meal_type}??", description="????????????????", estimated_cost=MEAL_DEFAULTS[meal_type])
+                        )
             if not day.attractions:
                 notes.append(f"day_{idx}_missing_attractions")
+                print(f"INFO autofill attractions | day_index={idx} date={day.date}", flush=True)
                 day.attractions = self.planner.create_fallback_plan(form_snapshot).days[0].attractions
 
         if len(plan.weather_info) < expected_days:
             notes.append("weather_info_incomplete")
+            print(
+                f"INFO autofill weather_info | existing={len(plan.weather_info)} expected={expected_days}",
+                flush=True,
+            )
             existing_dates = {info.date for info in plan.weather_info}
             for day in plan.days:
                 if day.date not in existing_dates:
