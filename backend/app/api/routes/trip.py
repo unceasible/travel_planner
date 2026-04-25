@@ -5,6 +5,7 @@ import traceback
 from fastapi import APIRouter, HTTPException
 
 from ...models.schemas import TripChatRequest, TripPlanResponse, TripRequest
+from ...services.agent_output_logger import timed_event
 from ...services.task_executor import get_trip_task_executor
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
@@ -20,7 +21,8 @@ async def plan_trip(request: TripRequest):
     """生成初次旅行计划."""
     try:
         executor = get_trip_task_executor()
-        return executor.plan_initial(request)
+        with timed_event("api.trip.plan.total", {"city": request.city, "travel_days": request.travel_days}):
+            return executor.plan_initial(request)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成旅行计划失败: {e}")
 
@@ -35,7 +37,8 @@ async def chat_trip(request: TripChatRequest):
     """通过聊天修改现有任务计划."""
     try:
         executor = get_trip_task_executor()
-        return executor.chat(request)
+        with timed_event("api.trip.chat.total", {"task_id": request.task_id}):
+            return executor.chat(request)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

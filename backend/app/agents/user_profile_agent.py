@@ -5,6 +5,7 @@ import re
 from copy import deepcopy
 from typing import Any, Dict
 
+from ..services.agent_output_logger import log_full_output
 from ..services.llm_service import get_cheap_llm
 from ..services.memory_store import MemoryStore
 
@@ -34,7 +35,7 @@ Input context:
 {
   "current_memory": {
     "profile": {
-      "preferences": ["??"],
+      "preferences": ["美食"],
       "dislikes": [],
       "constraints": [],
       "budget_sensitivity": "",
@@ -42,19 +43,19 @@ Input context:
     }
   },
   "context": {
-    "latest_user_message": "?????????????????????",
+    "latest_user_message": "我不吃海鲜，以后也希望多安排博物馆",
     "form": {
-      "preferences": ["????"]
+      "preferences": ["历史文化"]
     }
   }
 }
 
 Output JSON:
 {
-  "preferences": ["??", "????", "????"],
+  "preferences": ["美食", "历史文化", "博物馆"],
   "dislikes": [],
-  "constraints": ["???"],
-  "budget_sensitivity": "??????",
+  "constraints": ["不吃海鲜"],
+  "budget_sensitivity": "未明确表达",
   "notes": []
 }
 """
@@ -98,6 +99,7 @@ class UserProfileAgent:
             {"role": "system", "content": USER_PROFILE_PROMPT + "\n\n" + USER_PROFILE_FEW_SHOT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
         ])
+        self._print_full_output_block("agent_result:user_profile", response)
         return self._parse_profile_patch(response)
 
     def _parse_profile_patch(self, text: str) -> Dict[str, Any]:
@@ -157,3 +159,6 @@ class UserProfileAgent:
         data.setdefault(key, [])
         if value not in data[key]:
             data[key].append(value)
+
+    def _print_full_output_block(self, title: str, content: Any) -> None:
+        log_full_output(title, content)

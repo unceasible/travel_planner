@@ -1,0 +1,128 @@
+[
+  {
+    "text": "我想多去几个景点",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["attractions"],
+    "action": "increase"
+  },
+  {
+    "text": "景点有点少，能更丰富吗",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["attractions"],
+    "action": "increase"
+  },
+  {
+    "text": "第二天多加一个博物馆",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["attractions", "schedule"],
+    "action": "add"
+  },
+  {
+    "text": "酒店换便宜一点",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["hotels", "budget"],
+    "action": "replace"
+  },
+  {
+    "text": "住的地方能省钱吗",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["hotels", "budget"],
+    "action": "decrease"
+  },
+  {
+    "text": "晚餐不要吃辣",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["restaurants"],
+    "action": "remove"
+  },
+  {
+    "text": "行程有点累，轻松一点",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["schedule"],
+    "action": "decrease"
+  },
+  {
+    "text": "交通方式改成自驾",
+    "primary_intent": "modify",
+    "intents": ["modify"],
+    "domains": ["transportation"],
+    "action": "replace"
+  },
+  {
+    "text": "换成北京重新规划",
+    "primary_intent": "replan",
+    "intents": ["replan"],
+    "domains": ["city"],
+    "action": "replace"
+  },
+  {
+    "text": "多玩两天",
+    "primary_intent": "replan",
+    "intents": ["replan"],
+    "domains": ["dates"],
+    "action": "increase"
+  },
+  {
+    "text": "第二天去哪",
+    "primary_intent": "question",
+    "intents": ["question"],
+    "domains": ["schedule"],
+    "action": "ask"
+  },
+  {
+    "text": "总预算是多少",
+    "primary_intent": "question",
+    "intents": ["question"],
+    "domains": ["budget"],
+    "action": "ask"
+  },
+  {
+    "text": "这个计划不错，就这样",
+    "primary_intent": "satisfied",
+    "intents": ["satisfied"],
+    "domains": ["none"],
+    "action": "confirm"
+  },
+  {
+    "text": "计划挺好的，但是酒店换便宜点",
+    "primary_intent": "modify",
+    "intents": ["satisfied", "modify"],
+    "domains": ["hotels", "budget"],
+    "action": "replace"
+  },
+  {
+    "text": "第二天去哪，顺便多加一个景点",
+    "primary_intent": "modify",
+    "intents": ["question", "modify"],
+    "domains": ["schedule", "attractions"],
+    "action": "add"
+  },
+  {
+    "text": "谢谢你",
+    "primary_intent": "chitchat",
+    "intents": ["chitchat"],
+    "domains": ["none"],
+    "action": "chat"
+  },
+  {
+    "text": "帮我分析股票",
+    "primary_intent": "refuse",
+    "intents": ["refuse"],
+    "domains": ["none"],
+    "action": "refuse"
+  },
+  {
+    "text": "你怎么看股市，另外第二天换成博物馆",
+    "primary_intent": "modify",
+    "intents": ["refuse", "modify"],
+    "domains": ["schedule", "attractions"],
+    "action": "replace"
+  }
+]

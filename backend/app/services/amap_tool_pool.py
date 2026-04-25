@@ -1,5 +1,5 @@
 """Persistent Amap query worker pool backed by HTTP APIs."""
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -96,7 +96,12 @@ class _AmapWorker:
             if item and item not in search_keywords:
                 search_keywords.append(item)
         for search_keyword in search_keywords:
-            result_text = self._search_poi(city=city, keyword=search_keyword, types=[TYPE_RESTAURANT, TYPE_SHOPPING])
+            result_text = self._search_poi(
+                city=city,
+                keyword=search_keyword,
+                types=[TYPE_RESTAURANT, TYPE_SHOPPING],
+                relax_filter=True,
+            )
             try:
                 result_data = json.loads(result_text)
             except Exception:
@@ -125,7 +130,7 @@ class _AmapWorker:
         data = response.json()
         return json.dumps({"city": city, "forecasts": data.get("forecasts", [])}, ensure_ascii=False)
 
-    def _search_poi(self, city: str, keyword: str, types: List[str]) -> str:
+    def _search_poi(self, city: str, keyword: str, types: List[str], relax_filter: bool = False) -> str:
         city = city.strip()
         keyword = keyword.strip()
         params = {
@@ -141,10 +146,18 @@ class _AmapWorker:
         response = self.client.get("https://restapi.amap.com/v5/place/text", params=params)
         response.raise_for_status()
         data = response.json()
+        raw_pois = data.get("pois", [])
+        print(
+            f"INFO Amap raw_pois | city={city} keyword={keyword} raw_poi_count={len(raw_pois)}",
+            flush=True,
+        )
         pois = []
-        for item in data.get("pois", []):
+        for item in raw_pois:
             category = str(item.get("type", ""))
-            if types and not any(token in category for token in types):
+            if relax_filter:
+                if not (item.get("name") and item.get("address") and item.get("location")):
+                    continue
+            elif types and not any(token in category for token in types):
                 continue
             pois.append(
                 {
@@ -157,6 +170,10 @@ class _AmapWorker:
                     "price_range": item.get("business", {}).get("cost", ""),
                 }
             )
+        print(
+            f"INFO Amap filtered_pois | city={city} keyword={keyword} filtered_count={len(pois)} relax_filter={relax_filter}",
+            flush=True,
+        )
         return json.dumps({"pois": pois[:5]}, ensure_ascii=False)
 
     @staticmethod

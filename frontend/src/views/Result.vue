@@ -576,28 +576,28 @@ const moveAttraction = (dayIndex: number, attrIndex: number, direction: 'up' | '
 
 const formatMealName = (meal: any): string => {
   const fallback: Record<string, string> = {
-    breakfast: '????',
-    lunch: '????',
-    dinner: '????',
-    snack: '????'
+    breakfast: '早餐推荐',
+    lunch: '午餐推荐',
+    dinner: '晚餐推荐',
+    snack: '小吃推荐'
   }
   const name = (meal?.name || '').trim()
-  if (!name || /^(breakfast|lunch|dinner|snack)??$/i.test(name)) {
-    return fallback[meal?.type] || '????'
+  if (!name || /^(breakfast|lunch|dinner|snack)$/i.test(name)) {
+    return fallback[meal?.type] || '用餐推荐'
   }
   return name
 }
 
 const formatMealDescription = (meal: any): string => {
   const description = (meal?.description || '').trim()
-  if (!description || description === '????' || description === '????????????????') {
+  if (!description || description === '待补充' || description === '结合当天行程就近安排用餐') {
     const fallback: Record<string, string> = {
-      breakfast: '???????????????',
-      lunch: '?????????????',
-      dinner: '???????????????',
-      snack: '?????????????'
+      breakfast: '建议选择酒店或景点附近的便捷早餐',
+      lunch: '建议在景点周边享用本地午餐',
+      dinner: '建议安排一顿当地特色晚餐',
+      snack: '可根据路线上空档灵活补充'
     }
-    return fallback[meal?.type] || '????????????'
+    return fallback[meal?.type] || '建议结合当天行程就近安排'
   }
   return description
 }
@@ -993,49 +993,6 @@ const exportAsPDF = async () => {
   } catch (error: any) {
     console.error('导出PDF失败:', error)
     message.error({ content: `导出PDF失败: ${error.message}`, key: 'export' })
-  }
-}
-
-// 截取地图图片
-const captureMapImage = async () => {
-  if (!map) return
-
-  try {
-    // 获取地图容器
-    const mapContainer = document.getElementById('amap-container')
-    if (!mapContainer) return
-
-    // 使用高德地图的截图功能
-    const mapCanvas = mapContainer.querySelector('canvas')
-    if (mapCanvas) {
-      // 创建一个img元素替换地图容器
-      const img = document.createElement('img')
-      img.src = mapCanvas.toDataURL('image/png')
-      img.style.width = '100%'
-      img.style.height = '500px'
-      img.style.objectFit = 'cover'
-      img.id = 'map-snapshot'
-
-      // 隐藏原地图,显示截图
-      mapContainer.style.display = 'none'
-      mapContainer.parentElement?.appendChild(img)
-    }
-  } catch (error) {
-    console.error('截取地图失败:', error)
-  }
-}
-
-// 恢复地图
-const restoreMap = () => {
-  const mapContainer = document.getElementById('amap-container')
-  const snapshot = document.getElementById('map-snapshot')
-
-  if (mapContainer) {
-    mapContainer.style.display = 'block'
-  }
-
-  if (snapshot) {
-    snapshot.remove()
   }
 }
 

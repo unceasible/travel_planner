@@ -228,12 +228,17 @@ import { generateTripPlan } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
+type TripFormState = Omit<TripFormData, 'start_date' | 'end_date'> & {
+  start_date: Dayjs | null
+  end_date: Dayjs | null
+}
+
 const router = useRouter()
 const loading = ref(false)
 const loadingProgress = ref(0)
 const loadingStatus = ref('')
 
-const formData = reactive<TripFormData & { start_date: Dayjs | null; end_date: Dayjs | null }>({
+const formData = reactive<TripFormState>({
   nickname: '',
   city: '',
   start_date: null,
@@ -307,6 +312,7 @@ const handleSubmit = async () => {
     }
 
     const response = await generateTripPlan(requestData)
+    console.log('plan response', response)
 
     clearInterval(progressInterval)
     loadingProgress.value = 100
@@ -333,11 +339,12 @@ const handleSubmit = async () => {
         console.warn('sessionStorage cache failed, but navigation will continue:', storageError)
       }
 
-      message.success('????????!')
+      message.success('旅行计划生成成功!')
 
       const target = response.task_id
         ? { name: 'Result', query: { taskId: response.task_id } }
         : { name: 'Result' }
+      console.log('navigation target', target)
 
       try {
         await router.push(target)

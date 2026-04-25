@@ -1,9 +1,11 @@
 """FastAPI主应用"""
-
+# -*- coding: utf-8 -*-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..agents.trip_planner_agent import close_trip_planner_agent, get_trip_planner_agent
 from ..config import get_settings, validate_config, print_config
+from ..services.agent_output_logger import shutdown_agent_output_logger
+from ..services.intent_classifier import get_intent_classifier
 from .routes import trip, poi, map as map_routes
 
 # 获取配置
@@ -52,6 +54,8 @@ async def startup_event():
         print(f"\n❌ 配置验证失败:\n{e}")
         print("\n请检查.env文件并确保所有必要的配置项都已设置")
         raise
+
+    get_intent_classifier().warmup_example_embeddings()
     
     print("\n" + "="*60)
     print("📚 API文档: http://localhost:8000/docs")
@@ -63,6 +67,7 @@ async def startup_event():
 async def shutdown_event():
     """应用关闭事件"""
     close_trip_planner_agent()
+    shutdown_agent_output_logger()
     print("\n" + "="*60)
     print("👋 应用正在关闭...")
     print("="*60 + "\n")

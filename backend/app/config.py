@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     cheap_model_api_key: str = ""
 
     log_level: str = "INFO"
+    log_verbose_agent_output: bool = False
+    log_verbose_agent_output_to_file: bool = True
 
     class Config:
         env_file = ".env"

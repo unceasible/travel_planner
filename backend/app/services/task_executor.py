@@ -21,6 +21,9 @@ from ..models.schemas import (
     TripRequest,
     WeatherInfo,
 )
+from .agent_output_logger import log_event, timed_event
+from .intent_classifier import NON_PERSIST_INTENTS, get_intent_classifier
+from .llm_service import get_cheap_openai_client, get_cheap_openai_model
 from .memory_store import get_memory_store, now_iso
 
 
@@ -58,6 +61,7 @@ class TripTaskExecutor:
         self.retrieval_executor = ThreadPoolExecutor(max_workers=4)
         self.transport_executor = ThreadPoolExecutor(max_workers=8)
         self.profile_executor = ThreadPoolExecutor(max_workers=1)
+        self.intent_classifier = get_intent_classifier()
 
     def plan_initial(self, request: TripRequest) -> TripPlanResponse:
         print(
@@ -81,28 +85,33 @@ class TripTaskExecutor:
 
         retrieval_results = self._fetch_initial_context_parallel(request)
         print("=" * 80, flush=True)
-        print(f"INFO retrieval completed | keys={list(retrieval_results.keys())}", flush=True)
+        log_event("retrieval_completed", f"keys={list(retrieval_results.keys())}")
         print("=" * 80, flush=True)
         user_profile_summary = json.dumps(user_memory.get("profile", {}), ensure_ascii=False)
         print("INFO plan_initial build_plan_from_context start", flush=True)
-        plan = self.planner.build_plan_from_context(
-            request=request,
-            attractions=retrieval_results["attractions"],
-            weather=retrieval_results["weather"],
-            hotels=retrieval_results["hotels"],
-            restaurants=retrieval_results["restaurants"],
-            user_profile_summary=user_profile_summary,
-            extra_requirements=request.free_text_input or "",
-        )
+        with timed_event("plan_initial.build_plan_from_context", {"city": request.city, "travel_days": request.travel_days}):
+            plan = self.planner.build_plan_from_context(
+                request=request,
+                attractions=retrieval_results["attractions"],
+                weather=retrieval_results["weather"],
+                hotels=retrieval_results["hotels"],
+                restaurants=retrieval_results["restaurants"],
+                user_profile_summary=user_profile_summary,
+                extra_requirements=request.free_text_input or "",
+            )
         print("INFO plan_initial build_plan_from_context end", flush=True)
         print("INFO plan_initial add_transport start", flush=True)
         plan = self._add_transport_segments_parallel(plan, request.transportation)
         print("INFO plan_initial add_transport end", flush=True)
         print("INFO plan_initial aggregate_budget start", flush=True)
-        plan = self._aggregate_budget(plan, request.accommodation)
+        with timed_event("plan_initial.aggregate_budget", {"days": len(plan.days)}):
+            plan = self._aggregate_budget(plan, request.accommodation)
         print("INFO plan_initial aggregate_budget end", flush=True)
         print("INFO plan_initial reflect_and_fix start", flush=True)
-        plan, reflection = self._reflect_and_fix(plan, request.model_dump())
+        log_event("plan_before_reflect_and_fix", plan.model_dump_json(indent=2))
+        with timed_event("plan_initial.reflect_and_fix", {"days": len(plan.days)}):
+            plan, reflection = self._reflect_and_fix(plan, request.model_dump())
+        log_event("plan_after_reflect_and_fix", plan.model_dump_json(indent=2))
         print("INFO plan_initial reflect_and_fix end", flush=True)
 
         assistant_message = "已生成初步计划，你可以继续直接提意见让我修改。"
@@ -118,7 +127,8 @@ class TripTaskExecutor:
             }
         ]
         task_record["update_mode"] = "initial"
-        self.memory_store.write_task(task_record)
+        with timed_event("plan_initial.write_task", {"task_id": task_record["task_id"]}):
+            self.memory_store.write_task(task_record)
 
         return TripPlanResponse(
             success=True,
@@ -133,6 +143,36 @@ class TripTaskExecutor:
     def chat(self, request: TripChatRequest) -> TripPlanResponse:
         task_record = self.memory_store.read_task(request.task_id)
         form_snapshot = task_record.get("form_snapshot", {}) or {}
+        current_plan = self._dict_to_plan(task_record.get("current_plan", {}), form_snapshot)
+        conversation_history = list(task_record.get("conversation_log", []) or [])
+        trip_context = self._build_trip_context(form_snapshot)
+        with timed_event("chat.intent_classify", {"task_id": request.task_id}):
+            intent_result = self.intent_classifier.classify(request.user_message, trip_context)
+        log_event(
+            "decision_route",
+            {
+                "task_id": request.task_id,
+                "primary_intent": intent_result.primary_intent,
+                "intents": intent_result.intents,
+                "domains": intent_result.domains,
+                "action": intent_result.action,
+                "source": intent_result.source,
+                "matched_rule": intent_result.matched_rule,
+            },
+        )
+
+        if intent_result.primary_intent in NON_PERSIST_INTENTS:
+            assistant_message = self._build_non_persist_message(intent_result.primary_intent)
+            return TripPlanResponse(
+                success=True,
+                message="聊天已处理",
+                task_id=task_record["task_id"],
+                user_id=task_record["user_id"],
+                update_mode=intent_result.primary_intent,
+                assistant_message=assistant_message,
+                data=current_plan,
+            )
+
         user_memory = self.memory_store.load_or_create_user_memory(
             task_record["user_id"],
             task_record.get("nickname", form_snapshot.get("nickname", "")),
@@ -146,56 +186,145 @@ class TripTaskExecutor:
                     "nickname": task_record.get("nickname", ""),
                     "task_summary": self._summarize_task(task_record),
                     "latest_user_message": request.user_message,
+                    "intent": intent_result.model_dump(),
                     "user_memory": user_memory.get("profile", {}),
                     "form": form_snapshot,
                 }
             )
         )
-
-        update_mode = self._route_revision_intent(request.user_message)
-        current_plan = self._dict_to_plan(task_record.get("current_plan", {}), form_snapshot)
         user_profile_summary = json.dumps(user_memory.get("profile", {}), ensure_ascii=False)
 
-        if update_mode == "patch":
-            patch_context = self._fetch_patch_context_parallel(request.user_message, form_snapshot)
-            revised = self.planner.revise_plan(
-                current_plan=current_plan,
-                form_snapshot=form_snapshot,
-                user_message=request.user_message,
-                patch_context=patch_context,
-                user_profile_summary=user_profile_summary,
+        if intent_result.primary_intent == "question":
+            assistant_message = self._answer_question(current_plan, request.user_message)
+            self._persist_chat_turn(
+                task_record,
+                current_plan,
+                form_snapshot,
+                request.user_message,
+                assistant_message,
+                "question",
             )
+            return TripPlanResponse(
+                success=True,
+                message="已基于当前计划回答",
+                task_id=task_record["task_id"],
+                user_id=task_record["user_id"],
+                update_mode="question",
+                assistant_message=assistant_message,
+                data=current_plan,
+            )
+
+        if intent_result.primary_intent == "satisfied":
+            assistant_message = "好的，已保留当前计划。你之后还可以继续让我调整。"
+            self._persist_chat_turn(
+                task_record,
+                current_plan,
+                form_snapshot,
+                request.user_message,
+                assistant_message,
+                "satisfied",
+            )
+            return TripPlanResponse(
+                success=True,
+                message="已保留当前计划",
+                task_id=task_record["task_id"],
+                user_id=task_record["user_id"],
+                update_mode="satisfied",
+                assistant_message=assistant_message,
+                data=current_plan,
+            )
+
+        if intent_result.primary_intent == "unclear":
+            assistant_message = "我还不太确定你想调整哪一部分。你可以告诉我是想改景点、酒店、餐饮、交通、日期，还是整体重排吗？"
+            self._persist_chat_turn(
+                task_record,
+                current_plan,
+                form_snapshot,
+                request.user_message,
+                assistant_message,
+                "unclear",
+            )
+            return TripPlanResponse(
+                success=True,
+                message="需要进一步澄清",
+                task_id=task_record["task_id"],
+                user_id=task_record["user_id"],
+                update_mode="unclear",
+                assistant_message=assistant_message,
+                data=current_plan,
+            )
+
+        update_mode = "replan" if intent_result.primary_intent == "replan" else "patch"
+        if update_mode == "patch":
+            intent_domains = {domain for domain in intent_result.domains if domain != "none"}
+            selected_domains = self._domains_to_retrieval_domains(intent_result.domains)
+            patch_context = self._fetch_patch_context_parallel(request.user_message, form_snapshot, selected_domains)
+            if intent_domains == {"attractions"}:
+                log_event("chat_patch_route", "mode=attractions_only")
+                with timed_event("chat.revise_attractions_only", {"task_id": request.task_id}):
+                    revised = self.planner.revise_attractions_only(
+                        current_plan=current_plan,
+                        form_snapshot=form_snapshot,
+                        user_message=request.user_message,
+                        patch_context=patch_context,
+                        user_profile_summary=user_profile_summary,
+                        conversation_history=conversation_history,
+                    )
+            else:
+                log_event(
+                    "chat_patch_route",
+                    {
+                        "mode": "general",
+                        "intent_domains": sorted(intent_domains),
+                        "retrieval_domains": sorted(selected_domains),
+                    },
+                )
+                with timed_event("chat.revise_plan", {"task_id": request.task_id, "domains": sorted(intent_domains)}):
+                    revised = self.planner.revise_plan(
+                        current_plan=current_plan,
+                        form_snapshot=form_snapshot,
+                        user_message=request.user_message,
+                        patch_context=patch_context,
+                        user_profile_summary=user_profile_summary,
+                        conversation_history=conversation_history,
+                    )
             if self._validate_patch_result(revised, form_snapshot):
                 plan = revised
             else:
+                log_event("patch_validation_failed", "fallback_to_replan")
                 update_mode = "replan"
-                plan, form_snapshot = self._replan_from_message(form_snapshot, request.user_message, user_profile_summary)
+                plan, form_snapshot = self._replan_from_message(
+                    form_snapshot,
+                    request.user_message,
+                    user_profile_summary,
+                    conversation_history,
+                )
         else:
-            plan, form_snapshot = self._replan_from_message(form_snapshot, request.user_message, user_profile_summary)
+            plan, form_snapshot = self._replan_from_message(
+                form_snapshot,
+                request.user_message,
+                user_profile_summary,
+                conversation_history,
+            )
 
         plan = self._add_transport_segments_parallel(plan, form_snapshot.get("transportation", "公共交通"))
         plan = self._aggregate_budget(plan, form_snapshot.get("accommodation", "舒适型酒店"))
+        log_event("plan_before_reflect_and_fix", plan.model_dump_json(indent=2))
         plan, reflection = self._reflect_and_fix(plan, form_snapshot)
+        log_event("plan_after_reflect_and_fix", plan.model_dump_json(indent=2))
 
         assistant_message = self._build_revision_message(update_mode)
-        conversation_log = task_record.get("conversation_log", [])
-        conversation_log.extend(
-            [
-                {"role": "user", "message": request.user_message, "timestamp": now_iso()},
-                {"role": "assistant", "message": assistant_message, "timestamp": now_iso(), "update_mode": update_mode},
-            ]
+        if "refuse" in intent_result.intents and intent_result.primary_intent != "refuse":
+            assistant_message += " 另外，非旅游相关的问题我不能展开回答。"
+        self._persist_chat_turn(
+            task_record,
+            plan,
+            form_snapshot,
+            request.user_message,
+            assistant_message,
+            update_mode,
+            reflection,
         )
-
-        task_record["current_plan"] = plan.model_dump()
-        task_record["form_snapshot"] = form_snapshot
-        task_record["budget_ledger"] = self._build_budget_ledger(plan)
-        task_record["reflection_log"] = task_record.get("reflection_log", []) + [reflection]
-        task_record["conversation_log"] = conversation_log
-        task_record["update_mode"] = update_mode
-        task_record["city"] = plan.city
-        task_record["date_range"] = f"{plan.start_date} to {plan.end_date}"
-        task_record["travel_days"] = len(plan.days)
-        self.memory_store.write_task(task_record)
 
         return TripPlanResponse(
             success=True,
@@ -245,54 +374,84 @@ class TripTaskExecutor:
         return record, user_memory
 
     def _fetch_initial_context_parallel(self, request: TripRequest) -> Dict[str, str]:
-        futures = {
-            "attractions": self.retrieval_executor.submit(self.planner.search_attractions, request, ""),
-            "hotels": self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation),
-            "restaurants": self.retrieval_executor.submit(
-                self.planner.search_restaurants,
-                request.city,
-                request.preferences[0] if request.preferences else "",
-            ),
-            "weather": self.retrieval_executor.submit(
-                self.planner.search_weather,
-                request.city,
-                request.start_date,
-                request.end_date,
-            ),
+        with timed_event("retrieval.initial.total", {"city": request.city, "travel_days": request.travel_days}):
+            futures = {
+                "attractions": self.retrieval_executor.submit(self.planner.search_attractions, request, ""),
+                "hotels": self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation),
+                "restaurants": self.retrieval_executor.submit(
+                    self.planner.search_restaurants,
+                    request.city,
+                    request.preferences[0] if request.preferences else "",
+                ),
+                "weather": self.retrieval_executor.submit(
+                    self.planner.search_weather,
+                    request.city,
+                    request.start_date,
+                    request.end_date,
+                ),
+            }
+            return self._wait_future_map(futures)
+
+    def _fetch_patch_context_parallel(
+        self,
+        message: str,
+        form_snapshot: Dict[str, Any],
+        selected_domains: set[str] | None = None,
+    ) -> Dict[str, str]:
+        with timed_event("retrieval.patch.total", {"domains": sorted(selected_domains or [])}):
+            request = self._dict_to_request(form_snapshot)
+            if selected_domains is None:
+                selected_domains = self._select_patch_domains(message)
+                if not selected_domains:
+                    selected_domains.add("attractions")
+            else:
+                selected_domains = set(selected_domains)
+            log_event("patch_retrieval_domains", sorted(selected_domains))
+
+            futures: Dict[str, Any] = {}
+            if "attractions" in selected_domains:
+                futures["attractions"] = self.retrieval_executor.submit(self.planner.search_attractions, request, "")
+            if "hotels" in selected_domains:
+                futures["hotels"] = self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation)
+            if "restaurants" in selected_domains:
+                futures["restaurants"] = self.retrieval_executor.submit(
+                    self.planner.search_restaurants,
+                    request.city,
+                    request.preferences[0] if request.preferences else "",
+                )
+            if "weather" in selected_domains:
+                futures["weather"] = self.retrieval_executor.submit(
+                    self.planner.search_weather,
+                    request.city,
+                    request.start_date,
+                    request.end_date,
+                )
+            return self._wait_future_map(futures)
+
+    def _select_patch_domains(self, message: str) -> set[str]:
+        return {domain for domain, patterns in PATCH_DOMAIN_KEYWORDS.items() if any(re.search(p, message) for p in patterns)}
+
+    def _domains_to_retrieval_domains(self, domains: List[str]) -> set[str]:
+        retrievable = {"attractions", "hotels", "restaurants", "weather"}
+        return {domain for domain in domains if domain in retrievable}
+
+    def _build_trip_context(self, form_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "city": form_snapshot.get("city", ""),
+            "start_date": form_snapshot.get("start_date", ""),
+            "end_date": form_snapshot.get("end_date", ""),
+            "travel_days": form_snapshot.get("travel_days", 0),
+            "transportation": form_snapshot.get("transportation", ""),
+            "accommodation": form_snapshot.get("accommodation", ""),
+            "preferences": form_snapshot.get("preferences", []) or [],
         }
-        return self._wait_future_map(futures)
-
-    def _fetch_patch_context_parallel(self, message: str, form_snapshot: Dict[str, Any]) -> Dict[str, str]:
-        request = self._dict_to_request(form_snapshot)
-        selected_domains = {domain for domain, patterns in PATCH_DOMAIN_KEYWORDS.items() if any(re.search(p, message) for p in patterns)}
-        if not selected_domains:
-            selected_domains.add("attractions")
-
-        futures: Dict[str, Any] = {}
-        if "attractions" in selected_domains:
-            futures["attractions"] = self.retrieval_executor.submit(self.planner.search_attractions, request, "")
-        if "hotels" in selected_domains:
-            futures["hotels"] = self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation)
-        if "restaurants" in selected_domains:
-            futures["restaurants"] = self.retrieval_executor.submit(
-                self.planner.search_restaurants,
-                request.city,
-                request.preferences[0] if request.preferences else "",
-            )
-        if "weather" in selected_domains:
-            futures["weather"] = self.retrieval_executor.submit(
-                self.planner.search_weather,
-                request.city,
-                request.start_date,
-                request.end_date,
-            )
-        return self._wait_future_map(futures)
 
     def _wait_future_map(self, futures: Dict[str, Any]) -> Dict[str, str]:
         results: Dict[str, str] = {}
         for key, future in futures.items():
             try:
-                results[key] = future.result(timeout=90)
+                with timed_event("future.wait", {"key": key}):
+                    results[key] = future.result(timeout=90)
             except Exception as exc:
                 print(f"⚠️  并行任务{key}失败,使用空结果兜底: {exc}")
                 results[key] = ""
@@ -306,19 +465,27 @@ class TripTaskExecutor:
             return "replan"
         return "patch"
 
-    def _replan_from_message(self, form_snapshot: Dict[str, Any], user_message: str, user_profile_summary: str) -> Tuple[TripPlan, Dict[str, Any]]:
+    def _replan_from_message(
+        self,
+        form_snapshot: Dict[str, Any],
+        user_message: str,
+        user_profile_summary: str,
+        conversation_history: List[Dict[str, Any]] | None = None,
+    ) -> Tuple[TripPlan, Dict[str, Any]]:
         merged_form = self._merge_message_into_form(form_snapshot, user_message)
         request = self._dict_to_request(merged_form)
         retrieval_results = self._fetch_initial_context_parallel(request)
-        plan = self.planner.build_plan_from_context(
-            request=request,
-            attractions=retrieval_results.get("attractions", ""),
-            weather=retrieval_results.get("weather", ""),
-            hotels=retrieval_results.get("hotels", ""),
-            restaurants=retrieval_results.get("restaurants", ""),
-            user_profile_summary=user_profile_summary,
-            extra_requirements=request.free_text_input or "",
-        )
+        with timed_event("chat.replan.build_plan_from_context", {"city": request.city, "travel_days": request.travel_days}):
+            plan = self.planner.build_plan_from_context(
+                request=request,
+                attractions=retrieval_results.get("attractions", ""),
+                weather=retrieval_results.get("weather", ""),
+                hotels=retrieval_results.get("hotels", ""),
+                restaurants=retrieval_results.get("restaurants", ""),
+                user_profile_summary=user_profile_summary,
+                extra_requirements=request.free_text_input or "",
+                conversation_history=conversation_history or [],
+            )
         return plan, merged_form
 
     def _merge_message_into_form(self, form_snapshot: Dict[str, Any], user_message: str) -> Dict[str, Any]:
@@ -350,11 +517,13 @@ class TripTaskExecutor:
             for from_point, to_point in self._build_day_pairs(day):
                 jobs.append((day.day_index, from_point, to_point, transportation))
 
-        futures = [self.transport_executor.submit(self._estimate_transport_segment, job) for job in jobs]
+        with timed_event("transport_segments.submit", {"jobs": len(jobs), "days": len(plan.days)}):
+            futures = [self.transport_executor.submit(self._estimate_transport_segment, job) for job in jobs]
         grouped: Dict[int, List[TransportSegment]] = {}
         for future in futures:
             try:
-                day_index, segment = future.result(timeout=30)
+                with timed_event("transport_segments.future_wait", {"jobs": len(jobs)}):
+                    day_index, segment = future.result(timeout=30)
                 grouped.setdefault(day_index, []).append(segment)
             except Exception as exc:
                 print(f"⚠️  交通段估算失败,跳过该段: {exc}")
@@ -610,6 +779,71 @@ class TripTaskExecutor:
             "total_transportation": plan.budget.total_transportation if plan.budget else 0,
             "total": plan.budget.total if plan.budget else 0,
         }
+
+    def _persist_chat_turn(
+        self,
+        task_record: Dict[str, Any],
+        plan: TripPlan,
+        form_snapshot: Dict[str, Any],
+        user_message: str,
+        assistant_message: str,
+        update_mode: str,
+        reflection: Dict[str, Any] | None = None,
+    ) -> None:
+        conversation_log = list(task_record.get("conversation_log", []) or [])
+        conversation_log.extend(
+            [
+                {"role": "user", "message": user_message, "timestamp": now_iso()},
+                {"role": "assistant", "message": assistant_message, "timestamp": now_iso(), "update_mode": update_mode},
+            ]
+        )
+
+        task_record["current_plan"] = plan.model_dump()
+        task_record["form_snapshot"] = form_snapshot
+        task_record["budget_ledger"] = self._build_budget_ledger(plan)
+        if reflection is not None:
+            task_record["reflection_log"] = task_record.get("reflection_log", []) + [reflection]
+        task_record["conversation_log"] = conversation_log
+        task_record["update_mode"] = update_mode
+        task_record["city"] = plan.city
+        task_record["date_range"] = f"{plan.start_date} to {plan.end_date}"
+        task_record["travel_days"] = len(plan.days)
+        with timed_event("chat.write_task", {"task_id": task_record["task_id"], "update_mode": update_mode}):
+            self.memory_store.write_task(task_record)
+
+    def _answer_question(self, current_plan: TripPlan, user_message: str) -> str:
+        fallback = "我可以继续帮你查看当前旅行计划，但这个问题在现有计划里没有足够信息。你可以再具体问某一天、某个景点、酒店、餐饮或预算。"
+        try:
+            client = get_cheap_openai_client()
+            model = get_cheap_openai_model()
+            payload = {
+                "question": user_message,
+                "current_plan": current_plan.model_dump(),
+            }
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是旅游规划助手。只基于 current_plan 回答用户关于当前旅行计划的问题；"
+                            "不要修改计划，不要新增景点/酒店/餐饮。计划里没有的信息要明确说明。"
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0,
+            )
+            answer = (response.choices[0].message.content or "").strip()
+            return answer or fallback
+        except Exception as exc:
+            log_event("question_answer_error", str(exc))
+            return fallback
+
+    def _build_non_persist_message(self, intent: str) -> str:
+        if intent == "refuse":
+            return "对不起，我只是一个旅游规划助手，不能回答这个问题。你可以继续告诉我想调整的目的地、日期、景点、酒店、餐饮或交通。"
+        return "我在。关于这份旅行计划，你可以继续告诉我想改景点、酒店、餐饮、交通、日期，或者让我整体重新安排。"
 
     def _build_revision_message(self, update_mode: str) -> str:
         return "已根据你的意见完成局部调整。" if update_mode == "patch" else "你的需求涉及全局约束，已重新规划完整行程。"

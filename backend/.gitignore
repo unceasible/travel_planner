@@ -39,6 +39,7 @@ ENV/
 
 # 日志
 *.log
+runtime_data/cache/
 
 # 测试
 .pytest_cache/
