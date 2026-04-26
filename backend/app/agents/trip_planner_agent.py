@@ -268,6 +268,7 @@ class MultiAgentTripPlanner:
     def search_initial_attractions(self, request: TripRequest) -> str:
         target = self._dynamic_candidate_target(request.travel_days)
         keywords = self._build_initial_attraction_keywords(request)
+        keywords = self._extend_attraction_keywords(keywords, request)
         return self._search_initial_candidate_pool(
             kind="attraction",
             target=target,
@@ -275,6 +276,7 @@ class MultiAgentTripPlanner:
             search_one=lambda keyword: self.search_attractions(request, keyword),
             query_log_name="initial_attraction_query_plan",
             count_log_name="initial_attraction_candidate_count",
+            request=request,
         )
 
     def search_weather(self, city: str, start_date: str = "", end_date: str = "") -> str:
@@ -314,6 +316,7 @@ class MultiAgentTripPlanner:
     def search_initial_restaurants(self, request: TripRequest) -> str:
         target = self._dynamic_candidate_target(request.travel_days)
         keywords = self._build_initial_restaurant_keywords(request)
+        keywords = self._extend_restaurant_keywords(keywords, request)
         return self._search_initial_candidate_pool(
             kind="restaurant",
             target=target,
@@ -321,6 +324,7 @@ class MultiAgentTripPlanner:
             search_one=lambda keyword: self.search_restaurants(request.city, keyword),
             query_log_name="initial_restaurant_query_plan",
             count_log_name="initial_restaurant_candidate_count",
+            request=request,
         )
 
     def build_plan_from_context(
@@ -335,6 +339,21 @@ class MultiAgentTripPlanner:
         conversation_history: Optional[List[Dict[str, Any]]] = None,
     ) -> TripPlan:
         candidate_context = self.build_candidate_context(attractions, weather, hotels, restaurants, request.city)
+        candidate_context["attraction_candidates"] = self._rank_candidates(
+            list(candidate_context.get("attraction_candidates", []) or []),
+            "attraction",
+            request,
+        )
+        candidate_context["hotel_candidates"] = self._rank_candidates(
+            list(candidate_context.get("hotel_candidates", []) or []),
+            "hotel",
+            request,
+        )
+        candidate_context["restaurant_candidates"] = self._rank_candidates(
+            list(candidate_context.get("restaurant_candidates", []) or []),
+            "restaurant",
+            request,
+        )
         planning_constraints = self.build_initial_planning_constraints(request)
         self._attach_attraction_geo_clusters(candidate_context, planning_constraints)
         draft = self._parse_structured_plan(
@@ -347,7 +366,8 @@ class MultiAgentTripPlanner:
                 "不要把景点当作餐厅。午餐和晚餐优先选择真实餐厅，早餐可以选择真实餐厅或酒店附近简餐。"
                 "同一天景点必须优先按地理邻近性分组和排序，尽量减少酒店到景点、景点到景点、景点回酒店的移动距离。"
                 "当景点数量与路线紧凑冲突时，优先保证路线合理，不要为了凑数量安排过远景点。"
-                "如果 candidates.attraction_geo_clusters 存在，优先从同一个 cluster 中选择同一天景点。"
+                "如果 candidates.attraction_geo_clusters 或 candidates.attraction_candidate_groups 存在，优先从同一个 cluster/group 中选择同一天景点；"
+                "候选中的 candidate_score、meal_suitability、nearby_cluster_id、hotel_score 是后端规则计算出的质量提示，应优先参考。"
             ),
             {
                 "priority_rules": CONTEXT_PRIORITY_RULES,
@@ -516,9 +536,9 @@ class MultiAgentTripPlanner:
     def build_candidate_context(self, attractions: str, weather: str, hotels: str, restaurants: str, city: str) -> Dict[str, Any]:
         return {
             "city": city,
-            "attraction_candidates": self._extract_candidates_from_text(attractions, "attraction"),
-            "hotel_candidates": self._extract_candidates_from_text(hotels, "hotel"),
-            "restaurant_candidates": self._extract_candidates_from_text(restaurants, "restaurant"),
+            "attraction_candidates": self._rank_candidates(self._extract_candidates_from_text(attractions, "attraction"), "attraction"),
+            "hotel_candidates": self._rank_candidates(self._extract_candidates_from_text(hotels, "hotel"), "hotel"),
+            "restaurant_candidates": self._rank_candidates(self._extract_candidates_from_text(restaurants, "restaurant"), "restaurant"),
             "weather_raw": weather,
         }
 
@@ -559,6 +579,17 @@ class MultiAgentTripPlanner:
         hard_max = float(geo_constraints.get("hard_max_same_day_attraction_distance_m", SAME_DAY_HARD_MAX_DISTANCE_M))
         clusters = self._cluster_candidate_records(candidates, hard_max)
         candidate_context["attraction_geo_clusters"] = clusters
+        candidate_context["attraction_candidate_groups"] = [
+            {
+                "cluster_id": item.get("cluster_id"),
+                "theme": self._infer_group_theme(item.get("names", [])),
+                "candidate_ids": item.get("candidate_ids", []),
+                "center": item.get("center", {}),
+                "recommended_day_capacity": max(1, min(4, int(item.get("size", 1) or 1))),
+            }
+            for item in clusters
+        ]
+        self._annotate_candidates_with_geo_groups(candidate_context, clusters)
         log_event(
             "initial_attraction_candidate_geo_clusters",
             {
@@ -576,6 +607,88 @@ class MultiAgentTripPlanner:
                 ],
             },
         )
+        log_event(
+            "retrieval_candidate_groups",
+            {
+                "kind": "attraction",
+                "source": "algorithm",
+                "group_count": len(candidate_context["attraction_candidate_groups"]),
+                "groups": candidate_context["attraction_candidate_groups"],
+            },
+        )
+
+    def _annotate_candidates_with_geo_groups(
+        self,
+        candidate_context: Dict[str, Any],
+        clusters: List[Dict[str, Any]],
+    ) -> None:
+        cluster_centers: List[tuple[str, Location]] = []
+        for cluster in clusters:
+            center = cluster.get("center") or {}
+            try:
+                cluster_centers.append(
+                    (
+                        str(cluster.get("cluster_id") or ""),
+                        Location(longitude=float(center.get("longitude")), latitude=float(center.get("latitude"))),
+                    )
+                )
+            except Exception:
+                continue
+        if not cluster_centers:
+            return
+
+        main_cluster_id, main_center = max(
+            cluster_centers,
+            key=lambda item: next((cluster.get("size", 0) for cluster in clusters if cluster.get("cluster_id") == item[0]), 0),
+        )
+        for hotel in candidate_context.get("hotel_candidates", []) or []:
+            location = self._candidate_location(hotel)
+            if self._is_zero_location(location):
+                hotel["geo_quality"] = "missing"
+                hotel["distance_to_main_cluster_m"] = None
+                hotel["hotel_score"] = hotel.get("candidate_score", 0)
+                continue
+            distance = self._distance_between_locations(location, main_center)
+            hotel["geo_quality"] = "good"
+            hotel["distance_to_main_cluster_m"] = round(distance, 2)
+            hotel["nearby_cluster_id"] = main_cluster_id
+            hotel["hotel_score"] = round(float(hotel.get("candidate_score", 0)) + max(0.0, 12.0 - distance / 1500.0), 2)
+        candidate_context["hotel_candidates"] = sorted(
+            candidate_context.get("hotel_candidates", []) or [],
+            key=lambda item: item.get("hotel_score", item.get("candidate_score", 0)) or 0,
+            reverse=True,
+        )
+
+        for restaurant in candidate_context.get("restaurant_candidates", []) or []:
+            location = self._candidate_location(restaurant)
+            if self._is_zero_location(location):
+                restaurant["nearby_cluster_id"] = ""
+                restaurant["distance_to_nearby_cluster_m"] = None
+                continue
+            nearest_id, nearest_center = min(
+                cluster_centers,
+                key=lambda item: self._distance_between_locations(location, item[1]),
+            )
+            restaurant["nearby_cluster_id"] = nearest_id
+            restaurant["distance_to_nearby_cluster_m"] = round(self._distance_between_locations(location, nearest_center), 2)
+        candidate_context["restaurant_candidates"] = sorted(
+            candidate_context.get("restaurant_candidates", []) or [],
+            key=lambda item: (
+                item.get("nearby_cluster_id") == "",
+                item.get("distance_to_nearby_cluster_m") if item.get("distance_to_nearby_cluster_m") is not None else float("inf"),
+                -(item.get("candidate_score", 0) or 0),
+            ),
+        )
+
+    def _infer_group_theme(self, names: List[Any]) -> str:
+        text = " ".join(str(item or "") for item in names)
+        if any(token in text for token in ("博物馆", "历史", "古城", "古迹", "纪念馆", "文化")):
+            return "history_culture"
+        if any(token in text for token in ("公园", "山", "湖", "海", "湿地", "森林", "风景")):
+            return "nature"
+        if any(token in text for token in ("街", "商圈", "广场", "步行街")):
+            return "city_walk"
+        return "mixed"
 
     def _cluster_candidate_records(self, candidates: List[Dict[str, Any]], max_distance_m: float) -> List[Dict[str, Any]]:
         # Greedy distance clustering over candidate coordinates. Keep this deterministic and model-free.
@@ -651,6 +764,29 @@ class MultiAgentTripPlanner:
                 keywords.append(item)
         return self._unique_nonempty_texts(keywords)[:10]
 
+    def _extend_attraction_keywords(self, keywords: List[str], request: TripRequest) -> List[str]:
+        text = " ".join([*(request.preferences or []), request.free_text_input or ""])
+        expanded = list(keywords)
+        expanded.extend(["必去景点", "经典景点", "博物馆 历史文化", "古迹 历史街区 纪念馆", "自然风光 公园 山水", "商圈 街区"])
+        if any(token in text for token in ("博物馆", "历史", "文化", "古迹", "纪念馆")):
+            expanded.append("博物馆 古迹 历史街区 纪念馆")
+        if any(token in text for token in ("自然", "风景", "山", "海", "湖", "公园", "湿地")):
+            expanded.append("自然风光 公园 山 湖 海滨 湿地")
+        if any(token in text for token in ("亲子", "孩子", "儿童", "带娃")):
+            expanded.append("亲子 动物园 科技馆 公园 乐园")
+        if self._is_relaxed_trip(request) or any(token in text for token in ("轻松", "休闲", "不赶", "慢节奏")):
+            expanded.append("休闲 街区 城市公园 低强度")
+        return self._unique_nonempty_texts(expanded)[:10]
+
+    def _extend_restaurant_keywords(self, keywords: List[str], request: TripRequest) -> List[str]:
+        text_items = [*(request.preferences or []), request.free_text_input or ""]
+        expanded = list(keywords)
+        expanded.extend(["早餐 小吃 包子 面馆", "午餐 本地菜 特色餐厅", "晚餐 商圈美食 夜市", "火锅 海鲜 本地菜"])
+        for item in text_items:
+            if any(token in item for token in ("美食", "餐", "吃", "小吃", "菜", "海鲜", "火锅", "素食", "清真", "夜市", "咖啡")):
+                expanded.append(str(item))
+        return self._unique_nonempty_texts(expanded)[:10]
+
     def _unique_nonempty_texts(self, values: List[str]) -> List[str]:
         result: List[str] = []
         seen: set[str] = set()
@@ -670,6 +806,7 @@ class MultiAgentTripPlanner:
         search_one: Any,
         query_log_name: str,
         count_log_name: str,
+        request: Optional[TripRequest] = None,
     ) -> str:
         log_event(query_log_name, {"target": target, "keywords": keywords})
         if not keywords:
@@ -704,6 +841,7 @@ class MultiAgentTripPlanner:
                 seen.add(key)
                 merged.append(candidate)
 
+        merged = self._rank_candidates(merged, kind, request)
         returned = merged[:target]
         log_event(
             count_log_name,
@@ -713,10 +851,200 @@ class MultiAgentTripPlanner:
                 "raw_count": raw_count,
                 "deduped_count": len(merged),
                 "returned_count": len(returned),
+                "top_candidates": [
+                    {
+                        "name": item.get("name", ""),
+                        "score": item.get("candidate_score", 0),
+                        "reason": item.get("score_reason", ""),
+                    }
+                    for item in returned[:5]
+                ],
                 "errors": errors[:3],
             },
         )
+        log_event(
+            "retrieval_quality_summary",
+            {
+                "kind": kind,
+                "target": target,
+                "raw_count": raw_count,
+                "deduped_count": len(merged),
+                "returned_count": len(returned),
+                "scored_count": sum(1 for item in merged if "candidate_score" in item),
+                "zero_location_count": sum(1 for item in merged if self._is_zero_location(self._candidate_location(item))),
+            },
+        )
         return json.dumps({"pois": returned}, ensure_ascii=False)
+
+    def _rank_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        kind: str,
+        request: Optional[TripRequest] = None,
+    ) -> List[Dict[str, Any]]:
+        enriched: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            item = dict(candidate)
+            score, reason = self._score_candidate(item, kind, request)
+            item["candidate_score"] = round(score, 2)
+            item["score_reason"] = reason
+            if kind == "restaurant":
+                item["meal_suitability"] = self._restaurant_meal_suitability(item)
+                item["estimated_price_level"] = self._price_level(item.get("estimated_cost") or item.get("price_range"))
+            if kind == "hotel":
+                item["geo_quality"] = "missing" if self._is_zero_location(self._candidate_location(item)) else "good"
+                item["hotel_score"] = round(score, 2)
+            enriched.append(item)
+        enriched.sort(key=lambda item: item.get("candidate_score", 0), reverse=True)
+        log_event(
+            "retrieval_candidate_scored",
+            {
+                "kind": kind,
+                "count": len(enriched),
+                "top": [
+                    {
+                        "name": item.get("name", ""),
+                        "score": item.get("candidate_score", 0),
+                        "reason": item.get("score_reason", ""),
+                    }
+                    for item in enriched[:8]
+                ],
+            },
+        )
+        low_quality = [
+            {
+                "name": item.get("name", ""),
+                "score": item.get("candidate_score", 0),
+                "reason": item.get("score_reason", ""),
+            }
+            for item in enriched
+            if float(item.get("candidate_score", 0) or 0) < 35
+        ]
+        if low_quality:
+            log_event(
+                "retrieval_candidate_filtered",
+                {
+                    "kind": kind,
+                    "policy": "rank_down_only",
+                    "count": len(low_quality),
+                    "items": low_quality[:10],
+                },
+            )
+        return enriched
+
+    def _score_candidate(
+        self,
+        candidate: Dict[str, Any],
+        kind: str,
+        request: Optional[TripRequest] = None,
+    ) -> tuple[float, str]:
+        score = 50.0
+        reasons: List[str] = []
+        location = self._candidate_location(candidate)
+        if self._is_zero_location(location):
+            score -= 18
+            reasons.append("missing_geo")
+        else:
+            score += 12
+            reasons.append("has_geo")
+        if str(candidate.get("address") or "").strip():
+            score += 4
+        else:
+            score -= 6
+            reasons.append("missing_address")
+        rating = self._to_float_or_none(candidate.get("rating"))
+        if rating is not None:
+            if rating >= 4.5:
+                score += 10
+                reasons.append("high_rating")
+            elif rating >= 4.0:
+                score += 6
+            elif rating < 3.5:
+                score -= 6
+                reasons.append("low_rating")
+        text = self._candidate_search_text(candidate)
+        if request is not None:
+            matches = self._candidate_preference_matches(text, request)
+            if matches:
+                score += min(16, 4 * len(matches))
+                reasons.append("preference_match")
+        if kind == "attraction":
+            if any(token in text for token in ("风景名胜", "博物馆", "公园", "古迹", "纪念馆", "历史", "文化", "自然")):
+                score += 8
+            if any(token in text for token in ("相关", "入口", "停车场", "售票处", "服务区")):
+                score -= 10
+                reasons.append("weak_poi")
+        elif kind == "restaurant":
+            if any(token in text for token in ("餐饮", "餐厅", "饭店", "小吃", "早餐", "火锅", "海鲜", "美食", "菜")):
+                score += 10
+            if self._parse_money(candidate.get("estimated_cost") or candidate.get("price_range")) > 0:
+                score += 5
+                reasons.append("has_price")
+        elif kind == "hotel":
+            price_source = str(candidate.get("price_source") or "")
+            price = self._parse_money(candidate.get("estimated_cost") or candidate.get("price_range"))
+            if price_source in {TUNIU_DETAIL_PRICE_SOURCE, TUNIU_LOWEST_PRICE_SOURCE, "amap_cost"} and price > 0:
+                score += 20
+                reasons.append("real_price")
+            if self._hotel_price_matches_request(price, request):
+                score += 8
+                reasons.append("price_fit")
+            if request is not None and str(request.accommodation or "") and str(request.accommodation) in text:
+                score += 6
+        return max(0.0, min(100.0, score)), ",".join(reasons[:5])
+
+    def _candidate_search_text(self, candidate: Dict[str, Any]) -> str:
+        return " ".join(
+            str(candidate.get(key) or "")
+            for key in ("name", "address", "category", "type", "description")
+        )
+
+    def _candidate_preference_matches(self, text: str, request: TripRequest) -> List[str]:
+        haystack = self._normalize_name(text)
+        tokens: List[str] = []
+        for value in [*(request.preferences or []), request.free_text_input or ""]:
+            for token in re.split(r"[\s,，;；、/]+", str(value or "")):
+                token = token.strip()
+                if len(token) >= 2:
+                    tokens.append(token)
+        matched = []
+        for token in self._unique_nonempty_texts(tokens):
+            if self._normalize_name(token) in haystack:
+                matched.append(token)
+        return matched
+
+    def _restaurant_meal_suitability(self, candidate: Dict[str, Any]) -> List[str]:
+        text = self._candidate_search_text(candidate)
+        result: List[str] = []
+        if any(token in text for token in ("早餐", "包子", "粥", "面馆", "早点", "豆浆", "咖啡")):
+            result.append("breakfast")
+        if any(token in text for token in ("午餐", "本地菜", "特色", "餐厅", "饭店", "小吃")):
+            result.append("lunch")
+        if any(token in text for token in ("晚餐", "夜市", "火锅", "烧烤", "海鲜", "酒楼", "商圈")):
+            result.append("dinner")
+        return result or ["lunch", "dinner"]
+
+    def _price_level(self, value: Any) -> str:
+        price = self._parse_money(value)
+        if price <= 0:
+            return "unknown"
+        if price <= 40:
+            return "low"
+        if price <= 120:
+            return "medium"
+        return "high"
+
+    def _hotel_price_matches_request(self, price: int, request: Optional[TripRequest]) -> bool:
+        if price <= 0 or request is None:
+            return False
+        text = f"{request.accommodation or ''} {request.free_text_input or ''}"
+        if any(token in text for token in ("经济", "便宜", "省钱", "低价")):
+            return price <= 450
+        if any(token in text for token in ("豪华", "高端", "五星")):
+            return price >= 700
+        if any(token in text for token in ("舒适", "中档")):
+            return 300 <= price <= 800
+        return True
 
     def _candidate_dedupe_key(self, candidate: Dict[str, Any]) -> str:
         poi_id = str(candidate.get("poi_id") or "").strip()
@@ -1119,11 +1447,20 @@ class MultiAgentTripPlanner:
                     continue
                 if not unused_restaurants:
                     continue
-                candidate = unused_restaurants.pop(0)
+                selected_index = self._select_restaurant_candidate_index(day, unused_restaurants, meal_type)
+                candidate = unused_restaurants.pop(selected_index)
                 meal = self._candidate_to_meal(candidate, meal_type)
                 day.meals.append(meal)
                 existing_types.add(meal_type)
-                meal_autofill.append({"day_index": day.day_index, "type": meal_type, "name": meal.name})
+                meal_autofill.append(
+                    {
+                        "day_index": day.day_index,
+                        "type": meal_type,
+                        "name": meal.name,
+                        "nearby_cluster_id": candidate.get("nearby_cluster_id", ""),
+                        "meal_suitability": candidate.get("meal_suitability", []),
+                    }
+                )
 
         meal_after = [
             {"day_index": day.day_index, "types": sorted({meal.type for meal in (day.meals or [])})}
@@ -1173,6 +1510,38 @@ class MultiAgentTripPlanner:
                 candidate.get("estimated_cost") or candidate.get("price_range") or MEAL_COST_DEFAULTS.get(meal_type, 60)
             ),
         )
+
+    def _select_restaurant_candidate_index(
+        self,
+        day: DayPlan,
+        candidates: List[Dict[str, Any]],
+        meal_type: str,
+    ) -> int:
+        anchors = [
+            attraction.location
+            for attraction in (day.attractions or [])
+            if attraction.location and not self._is_zero_location(attraction.location)
+        ]
+        if day.hotel and day.hotel.location and not self._is_zero_location(day.hotel.location):
+            anchors.append(day.hotel.location)
+
+        best_index = 0
+        best_score = float("-inf")
+        for index, candidate in enumerate(candidates):
+            suitability = candidate.get("meal_suitability") or []
+            score = float(candidate.get("candidate_score") or 0)
+            if meal_type in suitability:
+                score += 20
+            elif meal_type == "breakfast" and "lunch" in suitability:
+                score += 4
+            candidate_location = self._candidate_location(candidate)
+            if anchors and not self._is_zero_location(candidate_location):
+                min_distance = min(self._distance_between_locations(candidate_location, anchor) for anchor in anchors)
+                score += max(0.0, 15.0 - min_distance / 800.0)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        return best_index
 
     def _repair_selected_attractions_by_geo(
         self,

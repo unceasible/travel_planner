@@ -318,7 +318,18 @@ class TuniuHotelService:
         return check_in.isoformat(), check_out.isoformat()
 
     def _build_keyword(self, accommodation: str, keyword: str = "") -> str:
-        parts = [str(keyword or "").strip(), str(accommodation or "").strip()]
+        accommodation_text = str(accommodation or "").strip()
+        parts = [str(keyword or "").strip(), accommodation_text]
+        if any(token in accommodation_text for token in ("经济", "便宜", "省钱")):
+            parts.extend(["经济型", "快捷酒店"])
+        elif any(token in accommodation_text for token in ("舒适", "中档")):
+            parts.extend(["舒适型", "商务酒店"])
+        elif any(token in accommodation_text for token in ("豪华", "高端", "五星")):
+            parts.extend(["豪华", "高星酒店"])
+        elif "民宿" in accommodation_text:
+            parts.append("民宿")
+        if any(token in accommodation_text for token in ("亲子", "带娃", "孩子")):
+            parts.append("亲子")
         return " ".join(part for part in parts if part)
 
 

@@ -626,6 +626,7 @@ class TripTaskExecutor:
 
         for day in plan.days:
             day.transport_segments = grouped.get(day.day_index, [])
+        self._log_transport_route_diagnostics(plan)
         return plan
 
     def _build_day_pairs(self, day) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
@@ -646,6 +647,44 @@ class TripTaskExecutor:
         if hotel_point:
             pairs.append((points[-1], hotel_point))
         return pairs
+
+    def _log_transport_route_diagnostics(self, plan: TripPlan) -> None:
+        diagnostics = []
+        far_warnings = []
+        for day in plan.days:
+            segments = list(day.transport_segments or [])
+            distances = [float(segment.distance or 0) for segment in segments]
+            max_distance = max(distances) if distances else 0.0
+            total_distance = sum(distances)
+            unresolved_transit = [
+                {
+                    "from": segment.from_name,
+                    "to": segment.to_name,
+                    "cost_source": segment.cost_source,
+                }
+                for segment in segments
+                if segment.mode == "公共交通"
+                and (
+                    segment.cost_source in {"route_estimate", "rule_based"}
+                    or "未获取到可解析" in str(segment.description or "")
+                    or "工具 '" in str(segment.description or "")
+                )
+            ]
+            item = {
+                "day_index": day.day_index,
+                "date": day.date,
+                "segment_count": len(segments),
+                "max_segment_distance_m": round(max_distance, 2),
+                "total_route_distance_m": round(total_distance, 2),
+                "has_unresolved_transit": bool(unresolved_transit),
+                "unresolved_transit_count": len(unresolved_transit),
+            }
+            diagnostics.append(item)
+            if max_distance > 30000 or unresolved_transit:
+                far_warnings.append({**item, "unresolved_transit": unresolved_transit[:3]})
+        log_event("transport_route_diagnostics", diagnostics)
+        if far_warnings:
+            log_event("transport_route_warning", far_warnings)
 
     def _estimate_transport_segment(self, job: Tuple[Any, ...]) -> Tuple[int, TransportSegment]:
         day_index, from_point, to_point, transportation, city, route_cache, route_cache_lock = job
