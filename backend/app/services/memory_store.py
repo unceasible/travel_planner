@@ -114,6 +114,7 @@ class MemoryStore:
             "update_mode": front_matter.get("update_mode", "initial"),
             "form_snapshot": self.extract_json_section(text, "Form Snapshot", default={}),
             "conversation_log": self.extract_json_section(text, "Conversation Log", default=[]),
+            "conversation_context": self.extract_json_section(text, "Conversation Context", default={}),
             "current_plan": self.extract_json_section(text, "Current Plan", default={}),
             "budget_ledger": self.extract_json_section(text, "Budget Ledger", default={}),
             "reflection_log": self.extract_json_section(text, "Reflection Log", default=[]),
@@ -158,6 +159,7 @@ class MemoryStore:
         sections = [
             ("Form Snapshot", task_record.get("form_snapshot", {})),
             ("Conversation Log", task_record.get("conversation_log", [])),
+            ("Conversation Context", task_record.get("conversation_context", {})),
             ("Current Plan", task_record.get("current_plan", {})),
             ("Budget Ledger", task_record.get("budget_ledger", {})),
             ("Reflection Log", task_record.get("reflection_log", [])),

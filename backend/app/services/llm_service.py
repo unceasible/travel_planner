@@ -47,7 +47,7 @@ def get_cheap_llm() -> HelloAgentsLLM:
             api_key=api_key or None,
             base_url=base_url or None,
             temperature=0.2,
-            max_tokens=800,
+            max_tokens=settings.cheap_model_max_output_tokens,
         )
         print("✅ 用户画像小模型初始化成功")
         print(f"   模型: {_cheap_llm_instance.model}")

@@ -32,10 +32,16 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4"
+    llm_context_window_tokens: int = 128000
+    llm_max_output_tokens: int = 8192
 
     cheap_model: str = ""
     cheap_model_base_url: str = ""
     cheap_model_api_key: str = ""
+    cheap_model_max_output_tokens: int = 1200
+    context_recent_raw_min_tokens: int = 10000
+    context_recent_raw_max_tokens: int = 40000
+    context_heavy_summary_workers: int = 4
 
     log_level: str = "INFO"
     log_verbose_agent_output: bool = False
@@ -108,5 +114,7 @@ def print_config() -> None:
     print(f"LLM API Key: {'已配置' if llm_api_key else '未配置'}")
     print(f"LLM Base URL: {llm_base_url}")
     print(f"LLM Model: {llm_model}")
+    print(f"LLM Max Output Tokens: {settings.llm_max_output_tokens}")
+    print(f"LLM Context Window Tokens: {settings.llm_context_window_tokens}")
     print(f"CHEAP_MODEL: {cheap_model if cheap_model else '未配置,将降级'}")
     print(f"日志级别: {settings.log_level}")

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Sequence
 import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from ..config import get_settings
 from .agent_output_logger import log_event, log_full_output, timed_event
 from .llm_service import get_cheap_openai_client, get_cheap_openai_model
 
@@ -717,6 +718,7 @@ class IntentClassifier:
             model=model,
             messages=messages,
             temperature=0,
+            max_tokens=get_settings().cheap_model_max_output_tokens,
             response_format={"type": "json_object"},
         )
         return response.choices[0].message.content or ""

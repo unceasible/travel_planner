@@ -224,7 +224,7 @@
 import { ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
-import { generateTripPlan } from '@/services/api'
+import { generateTripPlanStream, type TripStreamEvent } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
@@ -249,6 +249,23 @@ const formData = reactive<TripFormState>({
   preferences: [],
   free_text_input: ''
 })
+
+const handlePlanStreamEvent = ({ event, data }: TripStreamEvent) => {
+  if (event === 'heartbeat') {
+    if (!loadingStatus.value) {
+      loadingStatus.value = '正在生成旅行计划...'
+    }
+    return
+  }
+  if (event !== 'progress') return
+
+  if (typeof data?.percent === 'number') {
+    loadingProgress.value = Math.max(loadingProgress.value, data.percent)
+  }
+  if (data?.message) {
+    loadingStatus.value = data.message
+  }
+}
 
 // 监听日期变化,自动计算旅行天数
 watch([() => formData.start_date, () => formData.end_date], ([start, end]) => {
@@ -280,24 +297,6 @@ const handleSubmit = async () => {
   loadingProgress.value = 0
   loadingStatus.value = '正在初始化...'
 
-  // 模拟进度更新
-  const progressInterval = setInterval(() => {
-    if (loadingProgress.value < 90) {
-      loadingProgress.value += 10
-
-      // 更新状态文本
-      if (loadingProgress.value <= 30) {
-        loadingStatus.value = '🔍 正在搜索景点...'
-      } else if (loadingProgress.value <= 50) {
-        loadingStatus.value = '🌤️ 正在查询天气...'
-      } else if (loadingProgress.value <= 70) {
-        loadingStatus.value = '🏨 正在推荐酒店...'
-      } else {
-        loadingStatus.value = '📋 正在生成行程计划...'
-      }
-    }
-  }, 500)
-
   try {
     const requestData: TripFormData = {
       nickname: formData.nickname.trim(),
@@ -311,10 +310,9 @@ const handleSubmit = async () => {
       free_text_input: formData.free_text_input
     }
 
-    const response = await generateTripPlan(requestData)
+    const response = await generateTripPlanStream(requestData, handlePlanStreamEvent)
     console.log('plan response', response)
 
-    clearInterval(progressInterval)
     loadingProgress.value = 100
     loadingStatus.value = '✅ 完成!'
 
@@ -357,7 +355,6 @@ const handleSubmit = async () => {
       message.error(response.message || '生成失败')
     }
   } catch (error: any) {
-    clearInterval(progressInterval)
     message.error(error.message || '生成旅行计划失败,请稍后重试')
   } finally {
     setTimeout(() => {

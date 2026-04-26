@@ -346,6 +346,10 @@
             </div>
           </div>
 
+          <div v-if="chatLoading && chatStreamStatus" class="chat-stream-status">
+            {{ chatStreamStatus }}
+          </div>
+
           <a-textarea
             v-model:value="chatInput"
             placeholder="例如: 把第二天下午换成博物馆,晚饭预算控制在80以内"
@@ -393,7 +397,7 @@ import { DownOutlined } from '@ant-design/icons-vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
-import { chatWithTrip, getTripTask } from '@/services/api'
+import { chatWithTripStream, getTripTask, type TripStreamEvent } from '@/services/api'
 import type { TripPlan } from '@/types'
 
 const router = useRouter()
@@ -409,8 +413,21 @@ const updateMode = ref('')
 const userId = ref('')
 const chatInput = ref('')
 const chatLoading = ref(false)
+const chatStreamStatus = ref('')
 const chatHistory = ref<Array<{ role: 'user' | 'assistant'; content: string }>>([])
 let map: any = null
+
+const handleChatStreamEvent = ({ event, data }: TripStreamEvent) => {
+  if (event === 'heartbeat') {
+    if (!chatStreamStatus.value) {
+      chatStreamStatus.value = '正在等待模型生成...'
+    }
+    return
+  }
+  if (event === 'progress' && data?.message) {
+    chatStreamStatus.value = data.message
+  }
+}
 
 onMounted(async () => {
   taskId.value = String(route.query.taskId || sessionStorage.getItem('tripTaskId') || '')
@@ -460,12 +477,16 @@ const sendChatMessage = async () => {
 
   chatHistory.value.push({ role: 'user', content })
   chatLoading.value = true
+  chatStreamStatus.value = '正在发送请求...'
 
   try {
-    const response = await chatWithTrip({
-      task_id: taskId.value,
-      user_message: content
-    })
+    const response = await chatWithTripStream(
+      {
+        task_id: taskId.value,
+        user_message: content
+      },
+      handleChatStreamEvent
+    )
 
     if (response.success && response.data) {
       tripPlan.value = response.data
@@ -494,6 +515,7 @@ const sendChatMessage = async () => {
     message.error(error.message || '修改计划失败')
   } finally {
     chatLoading.value = false
+    chatStreamStatus.value = ''
     chatInput.value = ''
   }
 }
@@ -1204,6 +1226,15 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
   overflow-y: auto;
   margin-bottom: 12px;
   padding-right: 4px;
+}
+
+.chat-stream-status {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff7e6;
+  color: #ad6800;
+  font-size: 13px;
 }
 
 .chat-item {

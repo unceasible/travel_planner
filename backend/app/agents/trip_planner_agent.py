@@ -2,8 +2,10 @@
 """Trip planning multi-agent container."""
 
 import json
+import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -49,6 +51,13 @@ Few-shot output example:
           "description": "城市代表性历史文化景点",
           "visit_duration": 120,
           "estimated_cost": 50,
+          "type": "attraction"
+        },
+        {
+          "source_candidate_id": "attraction_1_demo",
+          "description": "与当天路线顺路的补充景点",
+          "visit_duration": 90,
+          "estimated_cost": 0,
           "type": "attraction"
         }
       ],
@@ -128,6 +137,14 @@ ATTRACTIONS_PATCH_FEW_SHOT = """
 """
 
 RESTAURANT_AGENT_PROMPT = "你是餐饮搜索专家，必须优先调用地图工具检索餐馆。"
+
+INITIAL_CANDIDATE_MIN = 8
+INITIAL_CANDIDATE_MAX = 30
+INITIAL_CANDIDATE_MULTIPLIER = 3.5
+INITIAL_SEARCH_WORKERS = 4
+MEAL_COST_DEFAULTS = {"breakfast": 25, "lunch": 60, "dinner": 90}
+SAME_DAY_IDEAL_MAX_DISTANCE_M = 8000.0
+SAME_DAY_HARD_MAX_DISTANCE_M = 15000.0
 
 CONTEXT_PRIORITY_RULES = [
     "历史用户画像只作为长期偏好背景。",
@@ -223,7 +240,7 @@ Example weather response:
 
 class MultiAgentTripPlanner:
     def __init__(self) -> None:
-        get_settings()
+        self.settings = get_settings()
         self.llm = get_llm()
         self.openai_client = get_openai_client()
         self.openai_model = get_openai_model()
@@ -242,6 +259,18 @@ class MultiAgentTripPlanner:
         keyword = keyword_hint or (request.preferences[0] if request.preferences else "景点")
         return self._safe_run("attractions", f"请搜索{request.city}适合{keyword}偏好的景点，返回名称、地址和坐标。")
 
+    def search_initial_attractions(self, request: TripRequest) -> str:
+        target = self._dynamic_candidate_target(request.travel_days)
+        keywords = self._build_initial_attraction_keywords(request)
+        return self._search_initial_candidate_pool(
+            kind="attraction",
+            target=target,
+            keywords=keywords,
+            search_one=lambda keyword: self.search_attractions(request, keyword),
+            query_log_name="initial_attraction_query_plan",
+            count_log_name="initial_attraction_candidate_count",
+        )
+
     def search_weather(self, city: str, start_date: str = "", end_date: str = "") -> str:
         if start_date and end_date:
             query = f"请查询{city}在{start_date}到{end_date}这几天的天气情况，重点返回这段日期内每天的天气。"
@@ -258,6 +287,18 @@ class MultiAgentTripPlanner:
         keyword = preference_hint or "本地特色餐厅"
         return self._safe_run("restaurants", f"请搜索{city}的{keyword}。")
 
+    def search_initial_restaurants(self, request: TripRequest) -> str:
+        target = self._dynamic_candidate_target(request.travel_days)
+        keywords = self._build_initial_restaurant_keywords(request)
+        return self._search_initial_candidate_pool(
+            kind="restaurant",
+            target=target,
+            keywords=keywords,
+            search_one=lambda keyword: self.search_restaurants(request.city, keyword),
+            query_log_name="initial_restaurant_query_plan",
+            count_log_name="initial_restaurant_candidate_count",
+        )
+
     def build_plan_from_context(
         self,
         request: TripRequest,
@@ -270,18 +311,31 @@ class MultiAgentTripPlanner:
         conversation_history: Optional[List[Dict[str, Any]]] = None,
     ) -> TripPlan:
         candidate_context = self.build_candidate_context(attractions, weather, hotels, restaurants, request.city)
+        planning_constraints = self.build_initial_planning_constraints(request)
+        self._attach_attraction_geo_clusters(candidate_context, planning_constraints)
         draft = self._parse_structured_plan(
-            "你是旅行规划专家。你只能从候选池中选择酒店、景点、餐饮。每个选择必须使用 source_candidate_id。",
+            (
+                "你是旅行规划专家。你只能从候选池中选择酒店、景点、餐饮。每个选择必须使用 source_candidate_id。"
+                "必须遵守 planning_constraints：候选足够时，每天景点数达到 min_attractions_per_day，尽量接近 "
+                "target_attractions_per_day，且不超过 max_attractions_per_day。每天必须包含 breakfast、lunch、dinner。"
+                "景点只能使用 attraction_candidates，酒店只能使用 hotel_candidates，餐饮只能使用 restaurant_candidates；"
+                "不要把景点当作餐厅。午餐和晚餐优先选择真实餐厅，早餐可以选择真实餐厅或酒店附近简餐。"
+                "同一天景点必须优先按地理邻近性分组和排序，尽量减少酒店到景点、景点到景点、景点回酒店的移动距离。"
+                "当景点数量与路线紧凑冲突时，优先保证路线合理，不要为了凑数量安排过远景点。"
+                "如果 candidates.attraction_geo_clusters 存在，优先从同一个 cluster 中选择同一天景点。"
+            ),
             {
                 "priority_rules": CONTEXT_PRIORITY_RULES,
                 "conversation_history": conversation_history or [],
                 "user_profile": user_profile_summary,
                 "form": request.model_dump(),
                 "extra_requirements": extra_requirements,
+                "planning_constraints": planning_constraints,
                 "candidates": candidate_context,
             },
         )
-        return self._draft_to_trip_plan(draft, request.model_dump(), candidate_context)
+        plan = self._draft_to_trip_plan(draft, request.model_dump(), candidate_context)
+        return self._ensure_initial_plan_density(plan, request.model_dump(), candidate_context, planning_constraints)
 
     def revise_plan(
         self,
@@ -442,6 +496,218 @@ class MultiAgentTripPlanner:
             "restaurant_candidates": self._extract_candidates_from_text(restaurants, "restaurant"),
             "weather_raw": weather,
         }
+
+    def build_initial_planning_constraints(self, request: TripRequest) -> Dict[str, Any]:
+        target_candidates = self._dynamic_candidate_target(request.travel_days)
+        relaxed = self._is_relaxed_trip(request)
+        return {
+            "target_attraction_candidates": target_candidates,
+            "target_restaurant_candidates": target_candidates,
+            "min_attractions_per_day": 1 if relaxed else 2,
+            "target_attractions_per_day": 2 if relaxed else 3,
+            "max_attractions_per_day": 3 if relaxed else 4,
+            "meal_requirements": {
+                "required_types": ["breakfast", "lunch", "dinner"],
+                "lunch_and_dinner_prefer_restaurant_candidates": True,
+                "breakfast_can_be_simple_near_hotel": True,
+                "do_not_use_attraction_candidates_as_restaurants": True,
+            },
+            "geo_constraints": {
+                "group_same_day_attractions_by_geo_proximity": True,
+                "order_attractions_to_reduce_travel_distance": True,
+                "ideal_max_same_day_attraction_distance_m": int(SAME_DAY_IDEAL_MAX_DISTANCE_M),
+                "hard_max_same_day_attraction_distance_m": int(SAME_DAY_HARD_MAX_DISTANCE_M),
+                "prefer_route_compactness_over_filling_attraction_count": True,
+                "use_attraction_geo_clusters_when_available": True,
+            },
+            "relaxed_pace": relaxed,
+        }
+
+    def _attach_attraction_geo_clusters(
+        self,
+        candidate_context: Dict[str, Any],
+        planning_constraints: Dict[str, Any],
+    ) -> None:
+        # Pure algorithmic geo clustering: no LLM, embedding, or external route API call here.
+        candidates = list(candidate_context.get("attraction_candidates", []) or [])
+        geo_constraints = planning_constraints.get("geo_constraints") or {}
+        hard_max = float(geo_constraints.get("hard_max_same_day_attraction_distance_m", SAME_DAY_HARD_MAX_DISTANCE_M))
+        clusters = self._cluster_candidate_records(candidates, hard_max)
+        candidate_context["attraction_geo_clusters"] = clusters
+        log_event(
+            "initial_attraction_candidate_geo_clusters",
+            {
+                "source": "algorithm",
+                "llm_used": False,
+                "cluster_count": len(clusters),
+                "hard_max_distance_m": hard_max,
+                "clusters": [
+                    {
+                        "cluster_id": item.get("cluster_id"),
+                        "size": item.get("size"),
+                        "candidate_ids": item.get("candidate_ids", []),
+                    }
+                    for item in clusters
+                ],
+            },
+        )
+
+    def _cluster_candidate_records(self, candidates: List[Dict[str, Any]], max_distance_m: float) -> List[Dict[str, Any]]:
+        # Greedy distance clustering over candidate coordinates. Keep this deterministic and model-free.
+        clusters: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            location = self._candidate_location(candidate)
+            if self._is_zero_location(location):
+                continue
+            best_index = -1
+            best_distance = float("inf")
+            for idx, cluster in enumerate(clusters):
+                distance = min(
+                    self._distance_between_locations(location, member["location"])
+                    for member in cluster["members"]
+                )
+                if distance < best_distance:
+                    best_index = idx
+                    best_distance = distance
+            member = {
+                "candidate_id": candidate.get("candidate_id", ""),
+                "name": candidate.get("name", ""),
+                "location": location,
+            }
+            if best_index >= 0 and best_distance <= max_distance_m:
+                clusters[best_index]["members"].append(member)
+            else:
+                clusters.append({"members": [member]})
+
+        output: List[Dict[str, Any]] = []
+        for idx, cluster in enumerate(clusters):
+            members = cluster["members"]
+            lng = sum(item["location"].longitude for item in members) / len(members)
+            lat = sum(item["location"].latitude for item in members) / len(members)
+            output.append(
+                {
+                    "cluster_id": f"cluster_{idx}",
+                    "size": len(members),
+                    "center": {"longitude": round(lng, 6), "latitude": round(lat, 6)},
+                    "candidate_ids": [item["candidate_id"] for item in members],
+                    "names": [item["name"] for item in members],
+                }
+            )
+        output.sort(key=lambda item: item["size"], reverse=True)
+        return output
+
+    def _dynamic_candidate_target(self, travel_days: Any) -> int:
+        try:
+            days = max(1, int(travel_days or 1))
+        except Exception:
+            days = 1
+        return max(INITIAL_CANDIDATE_MIN, min(INITIAL_CANDIDATE_MAX, math.ceil(days * INITIAL_CANDIDATE_MULTIPLIER)))
+
+    def _is_relaxed_trip(self, request: TripRequest) -> bool:
+        text = " ".join([*(request.preferences or []), request.free_text_input or ""]).lower()
+        return any(token in text for token in ("轻松", "休闲", "不赶", "别太赶", "慢节奏", "老人", "亲子", "带娃"))
+
+    def _build_initial_attraction_keywords(self, request: TripRequest) -> List[str]:
+        keywords: List[str] = []
+        keywords.extend(request.preferences or [])
+        keywords.extend(["必去景点", "经典景点", "博物馆 历史文化", "自然风光 公园 山水", "商圈 街区"])
+        free_text = request.free_text_input or ""
+        if any(token in free_text for token in ("博物馆", "历史", "文化", "古迹")):
+            keywords.append("博物馆 历史文化 古迹")
+        if any(token in free_text for token in ("自然", "风景", "山", "海", "湖", "公园")):
+            keywords.append("自然风光 公园 山水")
+        return self._unique_nonempty_texts(keywords)[:10]
+
+    def _build_initial_restaurant_keywords(self, request: TripRequest) -> List[str]:
+        keywords = ["本地特色餐厅", "特色菜", "小吃", "早餐", "午餐", "晚餐", "夜市", "商圈美食"]
+        food_tokens = ("美食", "餐", "吃", "小吃", "菜", "海鲜", "火锅", "素食", "清真", "夜市", "咖啡")
+        for item in [*(request.preferences or []), request.free_text_input or ""]:
+            if any(token in item for token in food_tokens):
+                keywords.append(item)
+        return self._unique_nonempty_texts(keywords)[:10]
+
+    def _unique_nonempty_texts(self, values: List[str]) -> List[str]:
+        result: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            key = self._normalize_name(text)
+            if text and key and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result
+
+    def _search_initial_candidate_pool(
+        self,
+        kind: str,
+        target: int,
+        keywords: List[str],
+        search_one: Any,
+        query_log_name: str,
+        count_log_name: str,
+    ) -> str:
+        log_event(query_log_name, {"target": target, "keywords": keywords})
+        if not keywords:
+            return json.dumps({"pois": []}, ensure_ascii=False)
+
+        raw_count = 0
+        errors: List[Dict[str, str]] = []
+        objects_by_keyword: Dict[str, List[Dict[str, Any]]] = {}
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        max_workers = min(INITIAL_SEARCH_WORKERS, len(keywords))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(search_one, keyword): keyword for keyword in keywords}
+            for future in as_completed(futures):
+                keyword = futures[future]
+                try:
+                    text = future.result()
+                    objects = self._extract_candidate_objects(text)
+                    raw_count += len(objects)
+                    objects_by_keyword[keyword] = objects
+                except Exception as exc:
+                    errors.append({"keyword": keyword, "error": repr(exc)})
+
+        for keyword in keywords:
+            for item in objects_by_keyword.get(keyword, []):
+                candidate = self._normalize_candidate_record(item, kind, len(merged))
+                if not candidate:
+                    continue
+                key = self._candidate_dedupe_key(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(candidate)
+
+        returned = merged[:target]
+        log_event(
+            count_log_name,
+            {
+                "target": target,
+                "keyword_count": len(keywords),
+                "raw_count": raw_count,
+                "deduped_count": len(merged),
+                "returned_count": len(returned),
+                "errors": errors[:3],
+            },
+        )
+        return json.dumps({"pois": returned}, ensure_ascii=False)
+
+    def _candidate_dedupe_key(self, candidate: Dict[str, Any]) -> str:
+        poi_id = str(candidate.get("poi_id") or "").strip()
+        if poi_id:
+            return f"id:{poi_id}"
+        name = self._normalize_name(str(candidate.get("name") or ""))
+        address = self._normalize_name(str(candidate.get("address") or ""))
+        location = candidate.get("location") or {}
+        try:
+            lng = round(float(location.get("longitude")), 5)
+            lat = round(float(location.get("latitude")), 5)
+            loc_key = f"{lng},{lat}"
+        except Exception:
+            loc_key = ""
+        return f"name:{name}|address:{address}|loc:{loc_key}"
+
     def _safe_run(self, domain: str, query: str) -> str:
         print(f"INFO Agent dispatch: {domain} | query={self._preview(query)}", flush=True)
         try:
@@ -488,6 +754,7 @@ class MultiAgentTripPlanner:
                         model=self.openai_model,
                         messages=messages,
                         temperature=0.2,
+                        max_tokens=self.settings.llm_max_output_tokens,
                         response_format={"type": "json_object"},
                     )
                 llm_attempts.append(
@@ -608,6 +875,7 @@ class MultiAgentTripPlanner:
                         model=self.openai_model,
                         messages=messages,
                         temperature=0.2,
+                        max_tokens=self.settings.llm_max_output_tokens,
                         response_format={"type": "json_object"},
                     )
                 llm_attempts.append(
@@ -720,6 +988,426 @@ class MultiAgentTripPlanner:
         }
         self._print_full_output_block("planner_raw_plan", json.dumps(data, ensure_ascii=False))
         return self._coerce_json_to_trip_plan(data, form_snapshot, candidate_context)
+
+    def _ensure_initial_plan_density(
+        self,
+        plan: TripPlan,
+        form_snapshot: Dict[str, Any],
+        candidate_context: Dict[str, Any],
+        planning_constraints: Dict[str, Any],
+    ) -> TripPlan:
+        min_attractions = int(planning_constraints.get("min_attractions_per_day", 2) or 2)
+        attraction_candidates = list(candidate_context.get("attraction_candidates", []) or [])
+        restaurant_candidates = list(candidate_context.get("restaurant_candidates", []) or [])
+
+        before_counts = [len(day.attractions or []) for day in plan.days]
+        used_attractions = {self._place_key_from_attraction(item) for day in plan.days for item in (day.attractions or [])}
+        unused_attractions = [
+            candidate for candidate in attraction_candidates if self._candidate_dedupe_key(candidate) not in used_attractions
+        ]
+        attraction_autofill: List[Dict[str, Any]] = []
+        far_route_warnings: List[Dict[str, Any]] = []
+        hard_max_distance = float(
+            (planning_constraints.get("geo_constraints") or {}).get(
+                "hard_max_same_day_attraction_distance_m",
+                SAME_DAY_HARD_MAX_DISTANCE_M,
+            )
+        )
+        geo_repair = self._repair_selected_attractions_by_geo(plan, planning_constraints)
+        far_route_warnings.extend(geo_repair.get("warnings", []))
+        for day in plan.days:
+            while len(day.attractions or []) < min_attractions and unused_attractions:
+                selection = self._select_nearest_attraction_candidate(day, unused_attractions, hard_max_distance)
+                if selection is None:
+                    far_route_warnings.append(
+                        {
+                            "day_index": day.day_index,
+                            "reason": "candidate_too_far_or_missing_location",
+                            "current_count": len(day.attractions or []),
+                            "remaining_candidates": len(unused_attractions),
+                            "hard_max_distance_m": hard_max_distance,
+                        }
+                    )
+                    break
+                candidate, selected_index, distance_m, anchor = selection
+                unused_attractions.pop(selected_index)
+                attraction = self._candidate_to_attraction(candidate)
+                day.attractions.append(attraction)
+                attraction_autofill.append(
+                    {
+                        "day_index": day.day_index,
+                        "name": attraction.name,
+                        "poi_id": attraction.poi_id or "",
+                        "distance_m": round(distance_m, 2) if distance_m is not None else None,
+                        "anchor": anchor,
+                    }
+                )
+            self._sort_day_attractions_by_nearest_neighbor(day)
+
+        after_counts = [len(day.attractions or []) for day in plan.days]
+        log_event(
+            "initial_attraction_density",
+            {
+                "min_per_day": min_attractions,
+                "target_per_day": planning_constraints.get("target_attractions_per_day"),
+                "max_per_day": planning_constraints.get("max_attractions_per_day"),
+                "candidate_count": len(attraction_candidates),
+                "before": before_counts,
+                "after": after_counts,
+                "underfilled_days": [
+                    {"day_index": day.day_index, "count": len(day.attractions or [])}
+                    for day in plan.days
+                    if len(day.attractions or []) < min_attractions
+                ],
+            },
+        )
+        log_event("initial_attraction_autofill", attraction_autofill)
+        geo_compactness = self._build_geo_compactness_log(plan, planning_constraints)
+        log_event("initial_day_geo_compactness", geo_compactness)
+        for item in geo_compactness:
+            if item.get("exceeds_hard_limit"):
+                far_route_warnings.append(
+                    {
+                        "day_index": item.get("day_index"),
+                        "reason": "day_route_exceeds_hard_limit",
+                        "max_adjacent_distance_m": item.get("max_adjacent_distance_m"),
+                        "hard_max_distance_m": hard_max_distance,
+                    }
+                )
+        log_event("initial_attraction_geo_autofill", attraction_autofill)
+        log_event("initial_far_route_warning", far_route_warnings)
+
+        required_meals = ["breakfast", "lunch", "dinner"]
+        meal_before = [
+            {"day_index": day.day_index, "types": sorted({meal.type for meal in (day.meals or [])})}
+            for day in plan.days
+        ]
+        used_restaurants = {self._place_key_from_meal(meal) for day in plan.days for meal in (day.meals or [])}
+        unused_restaurants = [
+            candidate for candidate in restaurant_candidates if self._candidate_dedupe_key(candidate) not in used_restaurants
+        ]
+        meal_autofill: List[Dict[str, Any]] = []
+        for day in plan.days:
+            existing_types = {meal.type for meal in (day.meals or [])}
+            for meal_type in required_meals:
+                if meal_type in existing_types:
+                    continue
+                if not unused_restaurants:
+                    continue
+                candidate = unused_restaurants.pop(0)
+                meal = self._candidate_to_meal(candidate, meal_type)
+                day.meals.append(meal)
+                existing_types.add(meal_type)
+                meal_autofill.append({"day_index": day.day_index, "type": meal_type, "name": meal.name})
+
+        meal_after = [
+            {"day_index": day.day_index, "types": sorted({meal.type for meal in (day.meals or [])})}
+            for day in plan.days
+        ]
+        log_event(
+            "initial_meal_coverage",
+            {
+                "required_types": required_meals,
+                "candidate_count": len(restaurant_candidates),
+                "before": meal_before,
+                "after": meal_after,
+                "missing_after": [
+                    {
+                        "day_index": day.day_index,
+                        "missing": [meal_type for meal_type in required_meals if meal_type not in {meal.type for meal in (day.meals or [])}],
+                    }
+                    for day in plan.days
+                    if any(meal_type not in {meal.type for meal in (day.meals or [])} for meal_type in required_meals)
+                ],
+            },
+        )
+        log_event("initial_meal_autofill", meal_autofill)
+        return plan
+
+    def _candidate_to_attraction(self, candidate: Dict[str, Any]) -> Attraction:
+        return Attraction(
+            name=str(candidate.get("name") or "景点"),
+            address=str(candidate.get("address") or "待补充地址"),
+            location=self._candidate_location(candidate),
+            visit_duration=120,
+            description="根据候选池自动补充的景点",
+            category=str(candidate.get("category") or candidate.get("type") or "景点"),
+            rating=self._to_float_or_none(candidate.get("rating")),
+            poi_id=str(candidate.get("poi_id") or ""),
+            ticket_price=self._parse_money(candidate.get("ticket_price", candidate.get("estimated_cost", 0))),
+        )
+
+    def _candidate_to_meal(self, candidate: Dict[str, Any], meal_type: str) -> Meal:
+        return Meal(
+            type=meal_type,
+            name=str(candidate.get("name") or f"{meal_type}推荐"),
+            address=str(candidate.get("address") or "") or None,
+            location=self._candidate_location(candidate),
+            description="根据餐饮候选池自动补充",
+            estimated_cost=self._parse_money(
+                candidate.get("estimated_cost") or candidate.get("price_range") or MEAL_COST_DEFAULTS.get(meal_type, 60)
+            ),
+        )
+
+    def _repair_selected_attractions_by_geo(
+        self,
+        plan: TripPlan,
+        planning_constraints: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # Pure algorithmic repair: regroup selected attractions by haversine distance; never call an LLM here.
+        before = self._build_geo_compactness_log(plan, planning_constraints)
+        if not any(item.get("exceeds_hard_limit") for item in before):
+            for day in plan.days:
+                self._sort_day_attractions_by_nearest_neighbor(day)
+            return {"changed": False, "warnings": []}
+
+        geo_constraints = planning_constraints.get("geo_constraints") or {}
+        hard_max = float(geo_constraints.get("hard_max_same_day_attraction_distance_m", SAME_DAY_HARD_MAX_DISTANCE_M))
+        max_per_day = int(planning_constraints.get("max_attractions_per_day", 4) or 4)
+        attraction_records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for day in plan.days:
+            for attraction in day.attractions or []:
+                key = self._place_key_from_attraction(attraction)
+                if key in seen:
+                    continue
+                seen.add(key)
+                attraction_records.append(
+                    {
+                        "attraction": attraction,
+                        "first_day_index": day.day_index,
+                        "location": attraction.location,
+                    }
+                )
+
+        clusters = self._cluster_attraction_records(attraction_records, hard_max)
+        buckets: List[List[Attraction]] = [[] for _ in plan.days]
+        warnings: List[Dict[str, Any]] = []
+        for cluster in clusters:
+            target_index = self._choose_day_bucket_for_cluster(cluster, buckets, max_per_day)
+            if target_index is None:
+                target_index = min(range(len(buckets)), key=lambda idx: len(buckets[idx])) if buckets else 0
+                warnings.append(
+                    {
+                        "reason": "geo_cluster_overflow",
+                        "cluster_size": len(cluster),
+                        "target_day_index": target_index,
+                    }
+                )
+            buckets[target_index].extend(item["attraction"] for item in cluster)
+
+        for idx, day in enumerate(plan.days):
+            day.attractions = buckets[idx] if idx < len(buckets) else []
+            self._sort_day_attractions_by_nearest_neighbor(day)
+
+        after = self._build_geo_compactness_log(plan, planning_constraints)
+        log_event(
+            "initial_geo_repair",
+            {
+                "source": "algorithm",
+                "llm_used": False,
+                "changed": True,
+                "hard_max_distance_m": hard_max,
+                "before": before,
+                "after": after,
+                "cluster_count": len(clusters),
+            },
+        )
+        for item in after:
+            if item.get("exceeds_hard_limit"):
+                warnings.append(
+                    {
+                        "day_index": item.get("day_index"),
+                        "reason": "geo_repair_still_exceeds_hard_limit",
+                        "max_adjacent_distance_m": item.get("max_adjacent_distance_m"),
+                        "hard_max_distance_m": hard_max,
+                    }
+                )
+        return {"changed": True, "warnings": warnings}
+
+    def _cluster_attraction_records(
+        self,
+        records: List[Dict[str, Any]],
+        max_distance_m: float,
+    ) -> List[List[Dict[str, Any]]]:
+        # Greedy distance clustering for already-selected attractions. This is intentionally model-free.
+        clusters: List[List[Dict[str, Any]]] = []
+        for record in records:
+            location = record.get("location")
+            if not location or self._is_zero_location(location):
+                clusters.append([record])
+                continue
+            best_index = -1
+            best_distance = float("inf")
+            for idx, cluster in enumerate(clusters):
+                located_members = [
+                    member for member in cluster if member.get("location") and not self._is_zero_location(member["location"])
+                ]
+                if not located_members:
+                    continue
+                distance = min(self._distance_between_locations(location, member["location"]) for member in located_members)
+                if distance < best_distance:
+                    best_index = idx
+                    best_distance = distance
+            if best_index >= 0 and best_distance <= max_distance_m:
+                clusters[best_index].append(record)
+            else:
+                clusters.append([record])
+        clusters.sort(key=lambda cluster: min(item.get("first_day_index", 999) for item in cluster))
+        return clusters
+
+    def _choose_day_bucket_for_cluster(
+        self,
+        cluster: List[Dict[str, Any]],
+        buckets: List[List[Attraction]],
+        max_per_day: int,
+    ) -> Optional[int]:
+        preferred = min((item.get("first_day_index", 0) for item in cluster), default=0)
+        ordered_indices = list(range(len(buckets)))
+        ordered_indices.sort(key=lambda idx: (idx != preferred, len(buckets[idx])))
+        for idx in ordered_indices:
+            if len(buckets[idx]) + len(cluster) <= max_per_day:
+                return idx
+        for idx in ordered_indices:
+            if not buckets[idx]:
+                return idx
+        return None
+
+    def _candidate_location(self, candidate: Dict[str, Any]) -> Location:
+        location = candidate.get("location") or {}
+        try:
+            return Location.model_validate(location)
+        except Exception:
+            return Location(longitude=0.0, latitude=0.0)
+
+    def _select_nearest_attraction_candidate(
+        self,
+        day: DayPlan,
+        candidates: List[Dict[str, Any]],
+        hard_max_distance_m: float,
+    ) -> Optional[tuple[Dict[str, Any], int, Optional[float], str]]:
+        if not candidates:
+            return None
+        anchors: List[tuple[str, Location]] = [
+            (f"attraction:{item.name}", item.location)
+            for item in (day.attractions or [])
+            if item.location and not self._is_zero_location(item.location)
+        ]
+        if not anchors and day.hotel and day.hotel.location and not self._is_zero_location(day.hotel.location):
+            anchors.append((f"hotel:{day.hotel.name}", day.hotel.location))
+        if not anchors:
+            return candidates[0], 0, None, "candidate_order"
+
+        best: Optional[tuple[Dict[str, Any], int, Optional[float], str]] = None
+        for index, candidate in enumerate(candidates):
+            candidate_location = self._candidate_location(candidate)
+            if self._is_zero_location(candidate_location):
+                continue
+            distances = [
+                (anchor_name, self._distance_between_locations(candidate_location, anchor_location))
+                for anchor_name, anchor_location in anchors
+            ]
+            anchor_name, min_distance = min(distances, key=lambda item: item[1])
+            if min_distance > hard_max_distance_m:
+                continue
+            if best is None or (min_distance is not None and min_distance < (best[2] or float("inf"))):
+                best = (candidate, index, min_distance, anchor_name)
+        return best
+
+    def _sort_day_attractions_by_nearest_neighbor(self, day: DayPlan) -> None:
+        attractions = list(day.attractions or [])
+        if len(attractions) <= 2:
+            return
+
+        ordered: List[Attraction] = []
+        remaining = attractions[:]
+        if day.hotel and day.hotel.location and not self._is_zero_location(day.hotel.location):
+            anchor = day.hotel.location
+            start_index = min(
+                range(len(remaining)),
+                key=lambda idx: self._distance_between_locations(anchor, remaining[idx].location),
+            )
+        else:
+            start_index = 0
+        ordered.append(remaining.pop(start_index))
+
+        while remaining:
+            anchor = ordered[-1].location
+            next_index = min(
+                range(len(remaining)),
+                key=lambda idx: self._distance_between_locations(anchor, remaining[idx].location),
+            )
+            ordered.append(remaining.pop(next_index))
+        day.attractions = ordered
+
+    def _build_geo_compactness_log(self, plan: TripPlan, planning_constraints: Dict[str, Any]) -> List[Dict[str, Any]]:
+        geo_constraints = planning_constraints.get("geo_constraints") or {}
+        ideal_max = float(geo_constraints.get("ideal_max_same_day_attraction_distance_m", SAME_DAY_IDEAL_MAX_DISTANCE_M))
+        hard_max = float(geo_constraints.get("hard_max_same_day_attraction_distance_m", SAME_DAY_HARD_MAX_DISTANCE_M))
+        result: List[Dict[str, Any]] = []
+        for day in plan.days:
+            distances = []
+            attractions = list(day.attractions or [])
+            for idx in range(len(attractions) - 1):
+                distances.append(self._distance_between_locations(attractions[idx].location, attractions[idx + 1].location))
+            max_adjacent = max(distances) if distances else 0.0
+            total = sum(distances)
+            result.append(
+                {
+                    "day_index": day.day_index,
+                    "date": day.date,
+                    "attraction_count": len(attractions),
+                    "max_adjacent_distance_m": round(max_adjacent, 2),
+                    "total_adjacent_distance_m": round(total, 2),
+                    "exceeds_ideal_limit": max_adjacent > ideal_max,
+                    "exceeds_hard_limit": max_adjacent > hard_max,
+                    "ideal_max_distance_m": ideal_max,
+                    "hard_max_distance_m": hard_max,
+                }
+            )
+        return result
+
+    def _distance_between_locations(self, loc1: Any, loc2: Any) -> float:
+        try:
+            lon1 = float(getattr(loc1, "longitude", loc1["longitude"]))
+            lat1 = float(getattr(loc1, "latitude", loc1["latitude"]))
+            lon2 = float(getattr(loc2, "longitude", loc2["longitude"]))
+            lat2 = float(getattr(loc2, "latitude", loc2["latitude"]))
+        except Exception:
+            return float("inf")
+        radius = 6371000.0
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        d_phi = math.radians(lat2 - lat1)
+        d_lam = math.radians(lon2 - lon1)
+        a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(d_lam / 2) ** 2)
+        return radius * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+    def _is_zero_location(self, location: Any) -> bool:
+        try:
+            lon = float(getattr(location, "longitude", location["longitude"]))
+            lat = float(getattr(location, "latitude", location["latitude"]))
+        except Exception:
+            return True
+        return abs(lon) < 0.000001 and abs(lat) < 0.000001
+
+    def _place_key_from_attraction(self, attraction: Attraction) -> str:
+        candidate = {
+            "poi_id": attraction.poi_id or "",
+            "name": attraction.name,
+            "address": attraction.address,
+            "location": attraction.location.model_dump() if attraction.location else {},
+        }
+        return self._candidate_dedupe_key(candidate)
+
+    def _place_key_from_meal(self, meal: Meal) -> str:
+        candidate = {
+            "poi_id": "",
+            "name": meal.name,
+            "address": meal.address or "",
+            "location": meal.location.model_dump() if meal.location else {},
+        }
+        return self._candidate_dedupe_key(candidate)
 
     def _merge_draft_with_current_plan(self, current_plan: TripPlan, draft: TripPlanDraft) -> Dict[str, Any]:
         current_data = current_plan.model_dump()

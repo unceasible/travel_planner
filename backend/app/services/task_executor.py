@@ -6,7 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from ..agents.trip_planner_agent import get_trip_planner_agent
 from ..agents.user_profile_agent import UserProfileAgent
@@ -22,6 +22,7 @@ from ..models.schemas import (
     WeatherInfo,
 )
 from .agent_output_logger import log_event, timed_event
+from .conversation_context import ConversationContextCompressor
 from .intent_classifier import NON_PERSIST_INTENTS, get_intent_classifier
 from .llm_service import get_cheap_openai_client, get_cheap_openai_model
 from .memory_store import get_memory_store, now_iso
@@ -53,6 +54,9 @@ MEAL_DEFAULTS = {"breakfast": 25, "lunch": 60, "dinner": 90, "snack": 30}
 HOTEL_DEFAULTS = {"经济型酒店": 300, "舒适型酒店": 500, "豪华酒店": 900, "民宿": 450}
 
 
+ProgressCallback = Callable[[str, Dict[str, Any]], None]
+
+
 class TripTaskExecutor:
     def __init__(self) -> None:
         self.memory_store = get_memory_store()
@@ -61,14 +65,38 @@ class TripTaskExecutor:
         self.retrieval_executor = ThreadPoolExecutor(max_workers=4)
         self.transport_executor = ThreadPoolExecutor(max_workers=8)
         self.profile_executor = ThreadPoolExecutor(max_workers=1)
+        self.context_executor = ThreadPoolExecutor(max_workers=1)
         self.intent_classifier = get_intent_classifier()
+        self.context_compressor = ConversationContextCompressor(self.memory_store)
 
-    def plan_initial(self, request: TripRequest) -> TripPlanResponse:
+    def _emit_progress(
+        self,
+        progress: ProgressCallback | None,
+        stage: str,
+        message: str,
+        percent: int,
+        **extra: Any,
+    ) -> None:
+        if progress is None:
+            return
+        payload = {"stage": stage, "message": message, "percent": percent, **extra}
+        progress(stage, payload)
+
+    def plan_initial(self, request: TripRequest, progress: ProgressCallback | None = None) -> TripPlanResponse:
         print(
             f"INFO plan_initial start | city={request.city} travel_days={request.travel_days} accommodation={request.accommodation}",
             flush=True,
         )
         task_record, user_memory = self._bootstrap_task(request)
+        self._emit_progress(
+            progress,
+            "task_created",
+            "任务已创建，正在准备旅行规划",
+            5,
+            task_id=task_record["task_id"],
+            user_id=task_record["user_id"],
+        )
+        self._emit_progress(progress, "profile_update_started", "正在并行更新用户画像", 8, task_id=task_record["task_id"])
         self._start_user_profile_update(
             self._fork_context(
                 {
@@ -83,12 +111,15 @@ class TripTaskExecutor:
             )
         )
 
+        self._emit_progress(progress, "retrieval_started", "正在检索景点、酒店、餐饮和天气", 15, task_id=task_record["task_id"])
         retrieval_results = self._fetch_initial_context_parallel(request)
+        self._emit_progress(progress, "retrieval_completed", "检索完成，正在整理候选信息", 35, task_id=task_record["task_id"])
         print("=" * 80, flush=True)
         log_event("retrieval_completed", f"keys={list(retrieval_results.keys())}")
         print("=" * 80, flush=True)
         user_profile_summary = json.dumps(user_memory.get("profile", {}), ensure_ascii=False)
         print("INFO plan_initial build_plan_from_context start", flush=True)
+        self._emit_progress(progress, "llm_started", "正在生成结构化旅行计划", 45, task_id=task_record["task_id"])
         with timed_event("plan_initial.build_plan_from_context", {"city": request.city, "travel_days": request.travel_days}):
             plan = self.planner.build_plan_from_context(
                 request=request,
@@ -99,15 +130,19 @@ class TripTaskExecutor:
                 user_profile_summary=user_profile_summary,
                 extra_requirements=request.free_text_input or "",
             )
+        self._emit_progress(progress, "llm_completed", "初步计划已生成，正在补充交通和预算", 75, task_id=task_record["task_id"])
         print("INFO plan_initial build_plan_from_context end", flush=True)
         print("INFO plan_initial add_transport start", flush=True)
+        self._emit_progress(progress, "transport_started", "正在计算每日交通段", 80, task_id=task_record["task_id"])
         plan = self._add_transport_segments_parallel(plan, request.transportation)
         print("INFO plan_initial add_transport end", flush=True)
         print("INFO plan_initial aggregate_budget start", flush=True)
+        self._emit_progress(progress, "budget_started", "正在汇总预算", 86, task_id=task_record["task_id"])
         with timed_event("plan_initial.aggregate_budget", {"days": len(plan.days)}):
             plan = self._aggregate_budget(plan, request.accommodation)
         print("INFO plan_initial aggregate_budget end", flush=True)
         print("INFO plan_initial reflect_and_fix start", flush=True)
+        self._emit_progress(progress, "reflection_started", "正在做最终检查", 92, task_id=task_record["task_id"])
         log_event("plan_before_reflect_and_fix", plan.model_dump_json(indent=2))
         with timed_event("plan_initial.reflect_and_fix", {"days": len(plan.days)}):
             plan, reflection = self._reflect_and_fix(plan, request.model_dump())
@@ -129,6 +164,7 @@ class TripTaskExecutor:
         task_record["update_mode"] = "initial"
         with timed_event("plan_initial.write_task", {"task_id": task_record["task_id"]}):
             self.memory_store.write_task(task_record)
+        self._emit_progress(progress, "persisted", "计划已保存", 98, task_id=task_record["task_id"])
 
         return TripPlanResponse(
             success=True,
@@ -140,14 +176,26 @@ class TripTaskExecutor:
             data=plan,
         )
 
-    def chat(self, request: TripChatRequest) -> TripPlanResponse:
+    def chat(self, request: TripChatRequest, progress: ProgressCallback | None = None) -> TripPlanResponse:
         task_record = self.memory_store.read_task(request.task_id)
         form_snapshot = task_record.get("form_snapshot", {}) or {}
         current_plan = self._dict_to_plan(task_record.get("current_plan", {}), form_snapshot)
-        conversation_history = list(task_record.get("conversation_log", []) or [])
+        prepared_context = self.context_compressor.prepare_context(task_record)
+        conversation_history = prepared_context.history
         trip_context = self._build_trip_context(form_snapshot)
+        self._emit_progress(progress, "intent_started", "正在识别你的修改意图", 8, task_id=request.task_id)
         with timed_event("chat.intent_classify", {"task_id": request.task_id}):
             intent_result = self.intent_classifier.classify(request.user_message, trip_context)
+        self._emit_progress(
+            progress,
+            "intent_completed",
+            "已识别修改意图",
+            18,
+            task_id=request.task_id,
+            primary_intent=intent_result.primary_intent,
+            domains=intent_result.domains,
+            action=intent_result.action,
+        )
         log_event(
             "decision_route",
             {
@@ -159,6 +207,15 @@ class TripTaskExecutor:
                 "source": intent_result.source,
                 "matched_rule": intent_result.matched_rule,
             },
+        )
+        self._emit_progress(
+            progress,
+            "route_decided",
+            "已选择处理分支",
+            24,
+            task_id=request.task_id,
+            route=intent_result.primary_intent,
+            context_mode=prepared_context.mode,
         )
 
         if intent_result.primary_intent in NON_PERSIST_INTENTS:
@@ -177,6 +234,7 @@ class TripTaskExecutor:
             task_record["user_id"],
             task_record.get("nickname", form_snapshot.get("nickname", "")),
         )
+        self._emit_progress(progress, "profile_update_started", "正在并行更新用户画像", 28, task_id=request.task_id)
         self._start_user_profile_update(
             self._fork_context(
                 {
@@ -195,6 +253,7 @@ class TripTaskExecutor:
         user_profile_summary = json.dumps(user_memory.get("profile", {}), ensure_ascii=False)
 
         if intent_result.primary_intent == "question":
+            self._emit_progress(progress, "patch_started", "正在基于当前计划回答问题", 55, task_id=request.task_id)
             assistant_message = self._answer_question(current_plan, request.user_message)
             self._persist_chat_turn(
                 task_record,
@@ -204,6 +263,8 @@ class TripTaskExecutor:
                 assistant_message,
                 "question",
             )
+            self._start_context_compression_if_needed(task_record)
+            self._emit_progress(progress, "persisted", "对话已保存", 96, task_id=request.task_id)
             return TripPlanResponse(
                 success=True,
                 message="已基于当前计划回答",
@@ -224,6 +285,8 @@ class TripTaskExecutor:
                 assistant_message,
                 "satisfied",
             )
+            self._start_context_compression_if_needed(task_record)
+            self._emit_progress(progress, "persisted", "对话已保存", 96, task_id=request.task_id)
             return TripPlanResponse(
                 success=True,
                 message="已保留当前计划",
@@ -244,6 +307,8 @@ class TripTaskExecutor:
                 assistant_message,
                 "unclear",
             )
+            self._start_context_compression_if_needed(task_record)
+            self._emit_progress(progress, "persisted", "对话已保存", 96, task_id=request.task_id)
             return TripPlanResponse(
                 success=True,
                 message="需要进一步澄清",
@@ -258,9 +323,12 @@ class TripTaskExecutor:
         if update_mode == "patch":
             intent_domains = {domain for domain in intent_result.domains if domain != "none"}
             selected_domains = self._domains_to_retrieval_domains(intent_result.domains)
+            self._emit_progress(progress, "retrieval_started", "正在检索本次修改需要的候选信息", 35, task_id=request.task_id)
             patch_context = self._fetch_patch_context_parallel(request.user_message, form_snapshot, selected_domains)
+            self._emit_progress(progress, "retrieval_completed", "候选信息检索完成", 48, task_id=request.task_id)
             if intent_domains == {"attractions"}:
                 log_event("chat_patch_route", "mode=attractions_only")
+                self._emit_progress(progress, "patch_started", "正在修改景点安排", 58, task_id=request.task_id)
                 with timed_event("chat.revise_attractions_only", {"task_id": request.task_id}):
                     revised = self.planner.revise_attractions_only(
                         current_plan=current_plan,
@@ -270,6 +338,7 @@ class TripTaskExecutor:
                         user_profile_summary=user_profile_summary,
                         conversation_history=conversation_history,
                     )
+                self._emit_progress(progress, "patch_completed", "景点安排已修改", 75, task_id=request.task_id)
             else:
                 log_event(
                     "chat_patch_route",
@@ -279,6 +348,7 @@ class TripTaskExecutor:
                         "retrieval_domains": sorted(selected_domains),
                     },
                 )
+                self._emit_progress(progress, "patch_started", "正在修改旅行计划", 58, task_id=request.task_id)
                 with timed_event("chat.revise_plan", {"task_id": request.task_id, "domains": sorted(intent_domains)}):
                     revised = self.planner.revise_plan(
                         current_plan=current_plan,
@@ -288,28 +358,36 @@ class TripTaskExecutor:
                         user_profile_summary=user_profile_summary,
                         conversation_history=conversation_history,
                     )
+                self._emit_progress(progress, "patch_completed", "旅行计划已修改", 75, task_id=request.task_id)
             if self._validate_patch_result(revised, form_snapshot):
                 plan = revised
             else:
                 log_event("patch_validation_failed", "fallback_to_replan")
                 update_mode = "replan"
+                self._emit_progress(progress, "replan_started", "局部修改校验未通过，正在整体重规划", 58, task_id=request.task_id)
                 plan, form_snapshot = self._replan_from_message(
                     form_snapshot,
                     request.user_message,
                     user_profile_summary,
                     conversation_history,
                 )
+                self._emit_progress(progress, "replan_completed", "整体重规划完成", 75, task_id=request.task_id)
         else:
+            self._emit_progress(progress, "replan_started", "正在整体重规划", 35, task_id=request.task_id)
             plan, form_snapshot = self._replan_from_message(
                 form_snapshot,
                 request.user_message,
                 user_profile_summary,
                 conversation_history,
             )
+            self._emit_progress(progress, "replan_completed", "整体重规划完成", 75, task_id=request.task_id)
 
+        self._emit_progress(progress, "transport_started", "正在重新计算交通段", 82, task_id=request.task_id)
         plan = self._add_transport_segments_parallel(plan, form_snapshot.get("transportation", "公共交通"))
+        self._emit_progress(progress, "budget_started", "正在重新汇总预算", 88, task_id=request.task_id)
         plan = self._aggregate_budget(plan, form_snapshot.get("accommodation", "舒适型酒店"))
         log_event("plan_before_reflect_and_fix", plan.model_dump_json(indent=2))
+        self._emit_progress(progress, "reflection_started", "正在做最终检查", 92, task_id=request.task_id)
         plan, reflection = self._reflect_and_fix(plan, form_snapshot)
         log_event("plan_after_reflect_and_fix", plan.model_dump_json(indent=2))
 
@@ -325,6 +403,8 @@ class TripTaskExecutor:
             update_mode,
             reflection,
         )
+        self._start_context_compression_if_needed(task_record)
+        self._emit_progress(progress, "persisted", "修改已保存", 96, task_id=request.task_id)
 
         return TripPlanResponse(
             success=True,
@@ -376,12 +456,11 @@ class TripTaskExecutor:
     def _fetch_initial_context_parallel(self, request: TripRequest) -> Dict[str, str]:
         with timed_event("retrieval.initial.total", {"city": request.city, "travel_days": request.travel_days}):
             futures = {
-                "attractions": self.retrieval_executor.submit(self.planner.search_attractions, request, ""),
+                "attractions": self.retrieval_executor.submit(self.planner.search_initial_attractions, request),
                 "hotels": self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation),
                 "restaurants": self.retrieval_executor.submit(
-                    self.planner.search_restaurants,
-                    request.city,
-                    request.preferences[0] if request.preferences else "",
+                    self.planner.search_initial_restaurants,
+                    request,
                 ),
                 "weather": self.retrieval_executor.submit(
                     self.planner.search_weather,
@@ -833,6 +912,7 @@ class TripTaskExecutor:
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 temperature=0,
+                max_tokens=self.context_compressor.settings.cheap_model_max_output_tokens,
             )
             answer = (response.choices[0].message.content or "").strip()
             return answer or fallback
@@ -862,6 +942,17 @@ class TripTaskExecutor:
 
     def _start_user_profile_update(self, context: Dict[str, Any]) -> None:
         self.profile_executor.submit(self.user_profile_agent.update_profile, context)
+
+    def _start_context_compression_if_needed(self, task_record: Dict[str, Any]) -> None:
+        if not self.context_compressor.needs_heavy_refresh(task_record):
+            return
+        task_id = task_record.get("task_id", "")
+        conversation_log = deepcopy(task_record.get("conversation_log", []) or [])
+        log_event(
+            "context_compression_background_submit",
+            {"task_id": task_id, "conversation_entries": len(conversation_log)},
+        )
+        self.context_executor.submit(self.context_compressor.refresh_heavy_summary, task_id, conversation_log)
 
 
 _trip_task_executor: TripTaskExecutor | None = None
