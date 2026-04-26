@@ -18,6 +18,12 @@ from ..models.schemas import Attraction, DayPlan, Location, Meal, TripPlan, Trip
 from ..services.agent_output_logger import log_event, log_full_output, timed_event
 from ..services.amap_tool_pool import AmapWorkerPool
 from ..services.llm_service import get_llm, get_openai_client, get_openai_model
+from ..services.tuniu_hotel_service import (
+    TUNIU_DETAIL_PRICE_SOURCE,
+    TUNIU_LOWEST_PRICE_SOURCE,
+    close_tuniu_hotel_service,
+    get_tuniu_hotel_service,
+)
 
 
 ATTRACTION_AGENT_PROMPT = "你是景点搜索专家，必须优先调用地图工具检索景点。"
@@ -280,7 +286,25 @@ class MultiAgentTripPlanner:
             query = f"请查询{city}最近天气情况。"
         return self._safe_run("weather", query)
 
-    def search_hotels(self, city: str, accommodation: str) -> str:
+    def search_hotels(self, city: str, accommodation: str, start_date: str = "", end_date: str = "") -> str:
+        if start_date and end_date:
+            try:
+                text = get_tuniu_hotel_service().search_hotels(
+                    city=city,
+                    accommodation=accommodation,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                data = json.loads(text)
+                if data.get("pois"):
+                    self._print_full_output_block("agent_result:hotels:tuniu", text)
+                    return text
+                log_event("hotel_search_fallback_to_amap", {"reason": "tuniu_empty", "city": city})
+            except Exception as exc:
+                log_event("tuniu_hotel_error", {"stage": "search", "city": city, "error": repr(exc)})
+                log_event("hotel_search_fallback_to_amap", {"reason": "tuniu_error", "city": city})
+        else:
+            log_event("hotel_search_fallback_to_amap", {"reason": "missing_dates", "city": city})
         return self._safe_run("hotels", f"请搜索{city}的{accommodation}酒店。")
 
     def search_restaurants(self, city: str, preference_hint: str = "") -> str:
@@ -316,6 +340,7 @@ class MultiAgentTripPlanner:
         draft = self._parse_structured_plan(
             (
                 "你是旅行规划专家。你只能从候选池中选择酒店、景点、餐饮。每个选择必须使用 source_candidate_id。"
+                "酒店信息只用于检索、展示和预算参考，严禁生成、建议或引导任何下单、预订、支付、锁房或创建订单行为。"
                 "必须遵守 planning_constraints：候选足够时，每天景点数达到 min_attractions_per_day，尽量接近 "
                 "target_attractions_per_day，且不超过 max_attractions_per_day。每天必须包含 breakfast、lunch、dinner。"
                 "景点只能使用 attraction_candidates，酒店只能使用 hotel_candidates，餐饮只能使用 restaurant_candidates；"
@@ -354,7 +379,7 @@ class MultiAgentTripPlanner:
             form_snapshot.get("city", ""),
         )
         draft = self._parse_structured_plan(
-            "你是旅行计划修改专家。请根据用户的新要求调整当前计划，尽量保留未受影响的酒店、餐饮和行程信息。",
+            "你是旅行计划修改专家。请根据用户的新要求调整当前计划，尽量保留未受影响的酒店、餐饮和行程信息。酒店信息只用于检索、展示和预算参考，严禁生成、建议或引导任何下单、预订、支付、锁房或创建订单行为。",
             {
                 "priority_rules": CONTEXT_PRIORITY_RULES,
                 "conversation_history": conversation_history or [],
@@ -1586,10 +1611,15 @@ class MultiAgentTripPlanner:
     def _normalize_hotel(self, item: Dict[str, Any], form_snapshot: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         candidate = self._resolve_candidate(item, candidates, 0)
         price_range = str((candidate or {}).get("price_range") or item.get("price_range") or "")
-        amap_cost = self._parse_money(price_range)
+        candidate_source = str((candidate or {}).get("price_source") or "")
+        tuniu_cost = self._parse_money((candidate or {}).get("estimated_cost", 0)) if candidate_source in {TUNIU_DETAIL_PRICE_SOURCE, TUNIU_LOWEST_PRICE_SOURCE} else 0
+        amap_cost = self._parse_money(price_range) if candidate_source != TUNIU_LOWEST_PRICE_SOURCE else 0
         item_cost = self._parse_money(item.get("estimated_cost", 0))
         candidate_cost = self._parse_money((candidate or {}).get("estimated_cost", 0))
-        if amap_cost > 0:
+        if tuniu_cost > 0:
+            estimated_cost = tuniu_cost
+            price_source = candidate_source
+        elif amap_cost > 0:
             estimated_cost = amap_cost
             price_source = "amap_cost"
         elif item_cost > 0:
@@ -1739,7 +1769,8 @@ class MultiAgentTripPlanner:
         if not name:
             return None
         price_range = str(item.get("price_range") or "")
-        price_from_amap = self._parse_money(price_range)
+        source = str(item.get("price_source") or "")
+        price_from_amap = self._parse_money(price_range) if source not in {TUNIU_DETAIL_PRICE_SOURCE, TUNIU_LOWEST_PRICE_SOURCE} else 0
         estimated_cost = self._parse_money(item.get("estimated_cost", 0))
         if kind == "hotel" and price_from_amap > 0:
             estimated_cost = price_from_amap
@@ -1754,7 +1785,7 @@ class MultiAgentTripPlanner:
             "ticket_price": self._parse_money(item.get("ticket_price", 0)),
             "price_range": price_range,
             "estimated_cost": estimated_cost,
-            "price_source": "amap_cost" if kind == "hotel" and price_from_amap > 0 else str(item.get("price_source") or ""),
+            "price_source": source or ("amap_cost" if kind == "hotel" and price_from_amap > 0 else ""),
             "poi_id": str(item.get("id") or item.get("poi_id") or ""),
         }
 
@@ -1850,6 +1881,7 @@ class MultiAgentTripPlanner:
 
     def close(self) -> None:
         self.amap_pool.close()
+        close_tuniu_hotel_service()
 
     def _preview(self, value: Any, limit: int = 50) -> str:
         text = "" if value is None else str(value)

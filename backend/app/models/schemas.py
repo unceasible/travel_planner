@@ -99,7 +99,7 @@ class Hotel(BaseModel):
     distance: str = Field(default="", description="距离景点距离")
     type: str = Field(default="", description="酒店类型")
     estimated_cost: int = Field(default=0, description="预估费用(元/晚)")
-    price_source: str = Field(default="estimate", description="价格来源: amap_cost/llm_estimate/default_estimate")
+    price_source: str = Field(default="estimate", description="价格来源: tuniu_detail_price/tuniu_lowest_price/amap_cost/llm_estimate/default_estimate")
 
 
 class TransportSegment(BaseModel):

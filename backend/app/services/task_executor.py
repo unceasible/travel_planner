@@ -460,7 +460,13 @@ class TripTaskExecutor:
         with timed_event("retrieval.initial.total", {"city": request.city, "travel_days": request.travel_days}):
             futures = {
                 "attractions": self.retrieval_executor.submit(self.planner.search_initial_attractions, request),
-                "hotels": self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation),
+                "hotels": self.retrieval_executor.submit(
+                    self.planner.search_hotels,
+                    request.city,
+                    request.accommodation,
+                    request.start_date,
+                    request.end_date,
+                ),
                 "restaurants": self.retrieval_executor.submit(
                     self.planner.search_initial_restaurants,
                     request,
@@ -494,7 +500,13 @@ class TripTaskExecutor:
             if "attractions" in selected_domains:
                 futures["attractions"] = self.retrieval_executor.submit(self.planner.search_attractions, request, "")
             if "hotels" in selected_domains:
-                futures["hotels"] = self.retrieval_executor.submit(self.planner.search_hotels, request.city, request.accommodation)
+                futures["hotels"] = self.retrieval_executor.submit(
+                    self.planner.search_hotels,
+                    request.city,
+                    request.accommodation,
+                    request.start_date,
+                    request.end_date,
+                )
             if "restaurants" in selected_domains:
                 futures["restaurants"] = self.retrieval_executor.submit(
                     self.planner.search_restaurants,
@@ -867,7 +879,7 @@ class TripTaskExecutor:
                 )
                 day.hotel.estimated_cost = HOTEL_DEFAULTS.get(accommodation, 500)
                 day.hotel.price_source = "default_estimate"
-            elif day.hotel and day.hotel.price_source != "amap_cost":
+            elif day.hotel and day.hotel.price_source not in {"amap_cost", "tuniu_detail_price", "tuniu_lowest_price"}:
                 day.hotel.price_source = day.hotel.price_source or "llm_estimate"
 
             attractions_cost = sum(max(item.ticket_price, 0) for item in day.attractions)

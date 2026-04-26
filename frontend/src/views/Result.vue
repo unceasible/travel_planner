@@ -235,7 +235,7 @@
                   <a-descriptions-item label="距离" :span="2">{{ day.hotel.distance }}</a-descriptions-item>
                   <a-descriptions-item :label="formatHotelPriceLabel(day.hotel.price_source)" :span="2">
                     ¥{{ day.hotel.estimated_cost || 0 }}
-                    <span v-if="day.hotel.price_source && day.hotel.price_source !== 'amap_cost'" style="color: #999; margin-left: 6px;">
+                    <span v-if="shouldShowHotelPriceSource(day.hotel.price_source)" style="color: #999; margin-left: 6px;">
                       {{ formatHotelPriceSource(day.hotel.price_source) }}
                     </span>
                   </a-descriptions-item>
@@ -661,7 +661,12 @@ const formatCostSource = (source: string): string => {
 }
 
 const formatHotelPriceLabel = (source?: string): string => {
-  return source === 'amap_cost' ? '高德参考价' : '预估预算(每晚)'
+  const map: Record<string, string> = {
+    tuniu_detail_price: '途牛实时价',
+    tuniu_lowest_price: '途牛最低价',
+    amap_cost: '高德参考价'
+  }
+  return map[source || ''] || '预估预算(每晚)'
 }
 
 const formatHotelPriceSource = (source?: string): string => {
@@ -671,6 +676,10 @@ const formatHotelPriceSource = (source?: string): string => {
     estimate: '估算'
   }
   return map[source || ''] || '估算'
+}
+
+const shouldShowHotelPriceSource = (source?: string): boolean => {
+  return ['llm_estimate', 'default_estimate', 'estimate'].includes(source || '')
 }
 
 // 加载所有景点图片

@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000"
 
     amap_api_key: str = ""
+    tuniu_api_key: str = ""
+    tuniu_member_key: str = ""
+    tuniu_mcp_url: str = "https://openapi.tuniu.cn/mcp/hotel"
     unsplash_access_key: str = ""
     unsplash_secret_key: str = ""
 
@@ -111,6 +114,7 @@ def print_config() -> None:
     print(f"版本: {settings.app_version}")
     print(f"服务器: {settings.host}:{settings.port}")
     print(f"高德地图API Key: {'已配置' if settings.amap_api_key else '未配置'}")
+    print(f"途牛酒店API Key: {'已配置' if settings.tuniu_api_key else '未配置,酒店将回退高德'}")
     print(f"LLM API Key: {'已配置' if llm_api_key else '未配置'}")
     print(f"LLM Base URL: {llm_base_url}")
     print(f"LLM Model: {llm_model}")

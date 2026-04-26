@@ -58,7 +58,9 @@ class AmapService:
         """初始化服务"""
         self.settings = get_settings()
         self.http_client = httpx.Client(timeout=12.0)
-        self.mcp_tool = get_amap_mcp_tool()
+
+    def _mcp_tool(self) -> MCPTool:
+        return get_amap_mcp_tool()
     
     def search_poi(self, keywords: str, city: str, citylimit: bool = True) -> List[POIInfo]:
         """
@@ -74,7 +76,7 @@ class AmapService:
         """
         try:
             # 调用MCP工具
-            result = self.mcp_tool.run({
+            result = self._mcp_tool().run({
                 "action": "call_tool",
                 "tool_name": "maps_text_search",
                 "arguments": {
@@ -108,7 +110,7 @@ class AmapService:
         """
         try:
             # 调用MCP工具
-            result = self.mcp_tool.run({
+            result = self._mcp_tool().run({
                 "action": "call_tool",
                 "tool_name": "maps_weather",
                 "arguments": {
@@ -187,7 +189,7 @@ class AmapService:
                     arguments["destination_city"] = destination_city
             
             # 调用MCP工具
-            result = self.mcp_tool.run({
+            result = self._mcp_tool().run({
                 "action": "call_tool",
                 "tool_name": tool_name,
                 "arguments": arguments
@@ -630,25 +632,39 @@ class AmapService:
         Returns:
             经纬度坐标
         """
+        if not address:
+            return None
         try:
-            arguments = {"address": address}
+            params = {
+                "key": self.settings.amap_api_key,
+                "address": address,
+                "output": "JSON",
+            }
             if city:
-                arguments["city"] = city
+                params["city"] = city
+            response = self.http_client.get("https://restapi.amap.com/v3/geocode/geo", params=params)
+            response.raise_for_status()
+            data = response.json()
+            if str(data.get("status")) == "1":
+                geocodes = data.get("geocodes") or []
+                if geocodes:
+                    location_text = str(geocodes[0].get("location") or "")
+                    if "," in location_text:
+                        lng_text, lat_text = location_text.split(",", 1)
+                        return Location(longitude=float(lng_text), latitude=float(lat_text))
+            log_event(
+                "amap_geocode_empty",
+                {
+                    "city": city or "",
+                    "address": address,
+                    "info": data.get("info") or "",
+                    "infocode": data.get("infocode") or "",
+                },
+            )
+        except Exception as exc:
+            log_event("amap_geocode_error", {"city": city or "", "address": address, "error": repr(exc)})
 
-            result = self.mcp_tool.run({
-                "action": "call_tool",
-                "tool_name": "maps_geo",
-                "arguments": arguments
-            })
-
-            print(f"地理编码结果: {result[:200]}...")
-
-            # TODO: 解析实际的坐标数据
-            return None
-
-        except Exception as e:
-            print(f"❌ 地理编码失败: {str(e)}")
-            return None
+        return None
 
     def get_poi_detail(self, poi_id: str) -> Dict[str, Any]:
         """
@@ -661,7 +677,7 @@ class AmapService:
             POI详情信息
         """
         try:
-            result = self.mcp_tool.run({
+            result = self._mcp_tool().run({
                 "action": "call_tool",
                 "tool_name": "maps_search_detail",
                 "arguments": {
