@@ -35,6 +35,7 @@ export interface Hotel {
   distance: string
   type: string
   estimated_cost?: number
+  price_source?: string
 }
 
 export interface Budget {
@@ -53,6 +54,7 @@ export interface TransportSegment {
   duration: number
   estimated_cost: number
   cost_source: 'route_fee' | 'route_estimate' | 'rule_based' | string
+  description?: string
 }
 
 export interface DayBudget {

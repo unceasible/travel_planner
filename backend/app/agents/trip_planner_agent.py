@@ -1585,15 +1585,32 @@ class MultiAgentTripPlanner:
 
     def _normalize_hotel(self, item: Dict[str, Any], form_snapshot: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         candidate = self._resolve_candidate(item, candidates, 0)
+        price_range = str((candidate or {}).get("price_range") or item.get("price_range") or "")
+        amap_cost = self._parse_money(price_range)
+        item_cost = self._parse_money(item.get("estimated_cost", 0))
+        candidate_cost = self._parse_money((candidate or {}).get("estimated_cost", 0))
+        if amap_cost > 0:
+            estimated_cost = amap_cost
+            price_source = "amap_cost"
+        elif item_cost > 0:
+            estimated_cost = item_cost
+            price_source = "llm_estimate"
+        elif candidate_cost > 0:
+            estimated_cost = candidate_cost
+            price_source = str((candidate or {}).get("price_source") or "estimate")
+        else:
+            estimated_cost = 0
+            price_source = str(item.get("price_source") or (candidate or {}).get("price_source") or "estimate")
         return {
             "name": str((candidate or {}).get("name") or item.get("name") or "推荐酒店"),
             "address": str((candidate or {}).get("address") or item.get("address") or ""),
             "location": (candidate or {}).get("location") or item.get("location"),
-            "price_range": str((candidate or {}).get("price_range") or item.get("price_range") or ""),
+            "price_range": price_range,
             "rating": str((candidate or {}).get("rating") or item.get("rating") or ""),
             "distance": str((candidate or {}).get("distance") or item.get("distance") or ""),
             "type": str((candidate or {}).get("type") or item.get("type") or form_snapshot.get("accommodation") or "舒适型酒店"),
-            "estimated_cost": self._parse_money(item.get("estimated_cost", (candidate or {}).get("estimated_cost", 0))),
+            "estimated_cost": estimated_cost,
+            "price_source": price_source,
         }
 
     def _repair_plan_json(self, raw_response: str, form_snapshot: Dict[str, Any], error: Exception, candidate_context: Dict[str, Any], max_retries: int = 2) -> Optional[TripPlan]:
@@ -1721,6 +1738,11 @@ class MultiAgentTripPlanner:
         name = str(item.get("name") or item.get("名称") or "").strip()
         if not name:
             return None
+        price_range = str(item.get("price_range") or "")
+        price_from_amap = self._parse_money(price_range)
+        estimated_cost = self._parse_money(item.get("estimated_cost", 0))
+        if kind == "hotel" and price_from_amap > 0:
+            estimated_cost = price_from_amap
         return {
             "candidate_id": f"{kind}_{index}_{self._normalize_name(name)[:24]}",
             "name": name,
@@ -1730,8 +1752,9 @@ class MultiAgentTripPlanner:
             "type": str(item.get("type") or kind),
             "rating": self._to_float_or_none(item.get("rating")),
             "ticket_price": self._parse_money(item.get("ticket_price", 0)),
-            "price_range": str(item.get("price_range") or ""),
-            "estimated_cost": self._parse_money(item.get("estimated_cost", 0)),
+            "price_range": price_range,
+            "estimated_cost": estimated_cost,
+            "price_source": "amap_cost" if kind == "hotel" and price_from_amap > 0 else str(item.get("price_source") or ""),
             "poi_id": str(item.get("id") or item.get("poi_id") or ""),
         }
 

@@ -232,11 +232,12 @@
                 <a-descriptions :column="2" size="small">
                   <a-descriptions-item label="地址">{{ day.hotel.address }}</a-descriptions-item>
                   <a-descriptions-item label="类型">{{ day.hotel.type }}</a-descriptions-item>
-                  <a-descriptions-item label="价格范围">{{ day.hotel.price_range }}</a-descriptions-item>
-                  <a-descriptions-item label="评分">{{ day.hotel.rating }}⭐</a-descriptions-item>
                   <a-descriptions-item label="距离" :span="2">{{ day.hotel.distance }}</a-descriptions-item>
-                  <a-descriptions-item label="预算(每晚)" :span="2">
+                  <a-descriptions-item :label="formatHotelPriceLabel(day.hotel.price_source)" :span="2">
                     ¥{{ day.hotel.estimated_cost || 0 }}
+                    <span v-if="day.hotel.price_source && day.hotel.price_source !== 'amap_cost'" style="color: #999; margin-left: 6px;">
+                      {{ formatHotelPriceSource(day.hotel.price_source) }}
+                    </span>
                   </a-descriptions-item>
                 </a-descriptions>
               </a-card>
@@ -273,6 +274,9 @@
                       </div>
                       <div style="margin-top: 4px; color: #1890ff; font-size: 13px;">
                         费用: ¥{{ item.estimated_cost }} ({{ formatCostSource(item.cost_source) }})
+                      </div>
+                      <div v-if="item.description" style="margin-top: 4px; color: #555; font-size: 13px;">
+                        {{ item.description }}
                       </div>
                     </div>
                   </a-list-item>
@@ -654,6 +658,19 @@ const formatCostSource = (source: string): string => {
     rule_based: '规则估算'
   }
   return map[source] || source || '估算'
+}
+
+const formatHotelPriceLabel = (source?: string): string => {
+  return source === 'amap_cost' ? '高德参考价' : '预估预算(每晚)'
+}
+
+const formatHotelPriceSource = (source?: string): string => {
+  const map: Record<string, string> = {
+    llm_estimate: '估算',
+    default_estimate: '档位估算',
+    estimate: '估算'
+  }
+  return map[source || ''] || '估算'
 }
 
 // 加载所有景点图片

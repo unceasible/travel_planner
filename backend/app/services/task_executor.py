@@ -3,9 +3,10 @@
 import json
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from copy import deepcopy
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Any, Callable, Dict, List, Tuple
 
 from ..agents.trip_planner_agent import get_trip_planner_agent
@@ -22,6 +23,7 @@ from ..models.schemas import (
     WeatherInfo,
 )
 from .agent_output_logger import log_event, timed_event
+from .amap_service import get_amap_service
 from .conversation_context import ConversationContextCompressor
 from .intent_classifier import NON_PERSIST_INTENTS, get_intent_classifier
 from .llm_service import get_cheap_openai_client, get_cheap_openai_model
@@ -64,6 +66,7 @@ class TripTaskExecutor:
         self.user_profile_agent = UserProfileAgent(self.memory_store)
         self.retrieval_executor = ThreadPoolExecutor(max_workers=4)
         self.transport_executor = ThreadPoolExecutor(max_workers=8)
+        self.route_executor = ThreadPoolExecutor(max_workers=4)
         self.profile_executor = ThreadPoolExecutor(max_workers=1)
         self.context_executor = ThreadPoolExecutor(max_workers=1)
         self.intent_classifier = get_intent_classifier()
@@ -592,9 +595,11 @@ class TripTaskExecutor:
 
     def _add_transport_segments_parallel(self, plan: TripPlan, transportation: str) -> TripPlan:
         jobs = []
+        route_cache: Dict[str, Dict[str, Any]] = {}
+        route_cache_lock = Lock()
         for day in plan.days:
             for from_point, to_point in self._build_day_pairs(day):
-                jobs.append((day.day_index, from_point, to_point, transportation))
+                jobs.append((day.day_index, from_point, to_point, transportation, plan.city, route_cache, route_cache_lock))
 
         with timed_event("transport_segments.submit", {"jobs": len(jobs), "days": len(plan.days)}):
             futures = [self.transport_executor.submit(self._estimate_transport_segment, job) for job in jobs]
@@ -616,8 +621,12 @@ class TripTaskExecutor:
         if not attractions:
             return []
         pairs = []
-        hotel_point = {"name": day.hotel.name, "location": day.hotel.location} if day.hotel else None
-        points = [{"name": item.name, "location": item.location} for item in attractions]
+        hotel_point = {
+            "name": day.hotel.name,
+            "address": day.hotel.address,
+            "location": day.hotel.location,
+        } if day.hotel else None
+        points = [{"name": item.name, "address": item.address, "location": item.location} for item in attractions]
         if hotel_point:
             pairs.append((hotel_point, points[0]))
         for idx in range(len(points) - 1):
@@ -626,33 +635,58 @@ class TripTaskExecutor:
             pairs.append((points[-1], hotel_point))
         return pairs
 
-    def _estimate_transport_segment(self, job: Tuple[int, Dict[str, Any], Dict[str, Any], str]) -> Tuple[int, TransportSegment]:
-        day_index, from_point, to_point, transportation = job
+    def _estimate_transport_segment(self, job: Tuple[Any, ...]) -> Tuple[int, TransportSegment]:
+        day_index, from_point, to_point, transportation, city, route_cache, route_cache_lock = job
         distance, has_geo = self._estimate_distance(from_point.get("location"), to_point.get("location"))
         mode = transportation
-        if transportation == "混合":
+        if has_geo and distance < 800:
+            mode = "步行"
+        elif transportation == "混合":
             mode = "步行" if distance < 1500 else "公共交通"
+        route_info = self._try_route_api(from_point, to_point, mode, city, route_cache, route_cache_lock)
+        if route_info:
+            distance = float(route_info.get("distance") or distance)
+            duration = int(route_info.get("duration") or self._estimate_duration(distance, mode))
+            route_cost = route_info.get("cost")
+            estimated_cost = int(route_cost) if route_cost is not None else self._estimate_cost(distance, mode)
+            cost_source = "route_fee" if route_cost is not None else "route_estimate"
+            description = str(route_info.get("description") or "")
+        else:
+            duration = self._estimate_duration(distance, mode)
+            estimated_cost = self._estimate_cost(distance, mode)
+            cost_source = "route_estimate" if has_geo else "rule_based"
+            description = self._fallback_transport_description(mode, distance, has_geo)
+            log_event(
+                "transport_distance_fallback",
+                {
+                    "from_name": from_point.get("name", ""),
+                    "to_name": to_point.get("name", ""),
+                    "mode": mode,
+                    "has_geo": has_geo,
+                    "distance": round(distance, 2),
+                    "source": cost_source,
+                    "description": description,
+                },
+            )
         segment = TransportSegment(
             from_name=from_point.get("name", "起点"),
             to_name=to_point.get("name", "终点"),
             mode=mode,
             distance=distance,
-            duration=self._estimate_duration(distance, mode),
-            estimated_cost=self._estimate_cost(distance, mode),
-            cost_source="route_estimate" if has_geo else "rule_based",
+            duration=duration,
+            estimated_cost=estimated_cost,
+            cost_source=cost_source,
+            description=description,
         )
         return day_index, segment
 
     def _estimate_distance(self, loc1: Any, loc2: Any) -> Tuple[float, bool]:
-        if not loc1 or not loc2:
+        point1 = self._read_location(loc1)
+        point2 = self._read_location(loc2)
+        if not point1 or not point2:
             return 3000.0, False
-        try:
-            lon1 = float(getattr(loc1, "longitude", loc1["longitude"]))
-            lat1 = float(getattr(loc1, "latitude", loc1["latitude"]))
-            lon2 = float(getattr(loc2, "longitude", loc2["longitude"]))
-            lat2 = float(getattr(loc2, "latitude", loc2["latitude"]))
-        except Exception:
-            return 3000.0, False
+        lon1, lat1 = point1
+        lon2, lat2 = point2
         radius = 6371000.0
         phi1 = math.radians(lat1)
         phi2 = math.radians(lat2)
@@ -661,6 +695,144 @@ class TripTaskExecutor:
         a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(d_lam / 2) ** 2)
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
         return max(radius * c, 100.0), True
+
+    def _read_location(self, loc: Any) -> Tuple[float, float] | None:
+        if not loc:
+            return None
+        try:
+            if hasattr(loc, "longitude") and hasattr(loc, "latitude"):
+                lon = float(loc.longitude)
+                lat = float(loc.latitude)
+            elif isinstance(loc, dict):
+                lon = float(loc["longitude"])
+                lat = float(loc["latitude"])
+            else:
+                return None
+        except Exception:
+            return None
+        if abs(lon) < 0.000001 and abs(lat) < 0.000001:
+            return None
+        return lon, lat
+
+    def _try_route_api(
+        self,
+        from_point: Dict[str, Any],
+        to_point: Dict[str, Any],
+        mode: str,
+        city: str,
+        route_cache: Dict[str, Dict[str, Any]],
+        route_cache_lock: Lock,
+    ) -> Dict[str, Any]:
+        route_type = self._route_type_from_mode(mode)
+        origin = self._route_address(from_point)
+        destination = self._route_address(to_point)
+        if not origin or not destination:
+            return {}
+        cache_key = f"{route_type}|{origin}|{destination}"
+        with route_cache_lock:
+            cached = route_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        log_event(
+            "transport_route_api_request",
+            {
+                "from_name": from_point.get("name", ""),
+                "to_name": to_point.get("name", ""),
+                "route_type": route_type,
+            },
+        )
+        future = self.route_executor.submit(
+            get_amap_service().plan_route,
+            origin,
+            destination,
+            city or None,
+            city or None,
+            route_type,
+            self._location_dict(from_point.get("location")),
+            self._location_dict(to_point.get("location")),
+        )
+        try:
+            with timed_event("transport.route_api", {"route_type": route_type}):
+                route_info = future.result(timeout=15)
+        except TimeoutError:
+            future.cancel()
+            log_event(
+                "transport_route_api_error",
+                {"from": origin, "to": destination, "route_type": route_type, "error": "timeout"},
+            )
+            return {}
+        except Exception as exc:
+            log_event(
+                "transport_route_api_error",
+                {"from": origin, "to": destination, "route_type": route_type, "error": repr(exc)},
+            )
+            return {}
+
+        if not self._valid_route_info(route_info):
+            log_event(
+                "transport_route_api_error",
+                {"from": origin, "to": destination, "route_type": route_type, "error": "empty_or_unparsed_result"},
+            )
+            route_info = {}
+        else:
+            log_event(
+                "transport_route_api_result",
+                {
+                    "from": origin,
+                    "to": destination,
+                    "route_type": route_type,
+                    "distance": route_info.get("distance"),
+                    "duration": route_info.get("duration"),
+                    "has_cost": route_info.get("cost") is not None,
+                    "description": route_info.get("description", ""),
+                },
+            )
+        with route_cache_lock:
+            route_cache[cache_key] = route_info
+        return route_info
+
+    def _route_type_from_mode(self, mode: str) -> str:
+        if mode == "步行":
+            return "walking"
+        if mode == "自驾":
+            return "driving"
+        return "transit"
+
+    def _route_address(self, point: Dict[str, Any]) -> str:
+        address = str(point.get("address") or "").strip()
+        name = str(point.get("name") or "").strip()
+        if address and name and name not in address:
+            return f"{address} {name}"
+        return address or name
+
+    def _location_dict(self, loc: Any) -> Dict[str, float] | None:
+        point = self._read_location(loc)
+        if not point:
+            return None
+        lon, lat = point
+        return {"longitude": lon, "latitude": lat}
+
+    def _valid_route_info(self, route_info: Any) -> bool:
+        if not isinstance(route_info, dict):
+            return False
+        try:
+            return float(route_info.get("distance") or 0) > 0 or int(route_info.get("duration") or 0) > 0
+        except Exception:
+            return False
+
+    def _fallback_transport_description(self, mode: str, distance_m: float, has_geo: bool) -> str:
+        if mode == "公共交通":
+            if not has_geo:
+                return "未获取到可用坐标，公交/地铁路线请以高德地图实时导航为准"
+            if distance_m >= 30000:
+                return "未获取到可解析的公交/地铁换乘方案；该段距离较远，建议以高德地图实时导航或城际交通为准"
+            return "未获取到可解析的公交/地铁换乘方案，请以高德地图实时导航为准"
+        if mode == "自驾":
+            return "未获取到可解析的自驾路线，距离和时间为规则估算，请以实时导航为准"
+        if mode == "步行":
+            return "未获取到可解析的步行路线，距离和时间为规则估算，请以实时导航为准"
+        return ""
 
     def _estimate_duration(self, distance_m: float, mode: str) -> int:
         speeds = {"步行": 4.0, "公共交通": 25.0, "自驾": 35.0}
@@ -694,6 +866,9 @@ class TripTaskExecutor:
                     flush=True,
                 )
                 day.hotel.estimated_cost = HOTEL_DEFAULTS.get(accommodation, 500)
+                day.hotel.price_source = "default_estimate"
+            elif day.hotel and day.hotel.price_source != "amap_cost":
+                day.hotel.price_source = day.hotel.price_source or "llm_estimate"
 
             attractions_cost = sum(max(item.ticket_price, 0) for item in day.attractions)
             meals_cost = sum(max(item.estimated_cost, 0) for item in day.meals)

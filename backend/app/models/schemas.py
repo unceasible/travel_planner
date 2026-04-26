@@ -99,6 +99,7 @@ class Hotel(BaseModel):
     distance: str = Field(default="", description="距离景点距离")
     type: str = Field(default="", description="酒店类型")
     estimated_cost: int = Field(default=0, description="预估费用(元/晚)")
+    price_source: str = Field(default="estimate", description="价格来源: amap_cost/llm_estimate/default_estimate")
 
 
 class TransportSegment(BaseModel):
@@ -110,6 +111,7 @@ class TransportSegment(BaseModel):
     duration: int = Field(default=0, description="时间(秒)")
     estimated_cost: int = Field(default=0, description="预估费用(元)")
     cost_source: str = Field(default="rule_based", description="费用来源: route_fee/route_estimate/rule_based")
+    description: str = Field(default="", description="路线说明")
 
 
 class DayBudget(BaseModel):
