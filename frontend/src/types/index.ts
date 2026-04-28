@@ -43,6 +43,7 @@ export interface Budget {
   total_hotels: number
   total_meals: number
   total_transportation: number
+  total_intercity_transportation: number
   total: number
 }
 
@@ -88,7 +89,35 @@ export interface WeatherInfo {
   wind_power: string
 }
 
+export interface IntercityTransportOption {
+  direction: string
+  mode: string
+  provider: string
+  departure_city: string
+  arrival_city: string
+  date: string
+  departure_time: string
+  arrival_time: string
+  duration_minutes: number
+  estimated_cost: number
+  code: string
+  data_source: string
+  description?: string
+}
+
+export interface IntercityTransportPlan {
+  status: string
+  preference: string
+  outbound_candidates: IntercityTransportOption[]
+  return_candidates: IntercityTransportOption[]
+  selected_outbound?: IntercityTransportOption
+  selected_return?: IntercityTransportOption
+  schedule_constraints: Record<string, any>
+  warnings: string[]
+}
+
 export interface TripPlan {
+  departure_city?: string
   city: string
   start_date: string
   end_date: string
@@ -96,14 +125,17 @@ export interface TripPlan {
   weather_info: WeatherInfo[]
   overall_suggestions: string
   budget?: Budget
+  intercity_transport?: IntercityTransportPlan
 }
 
 export interface TripFormData {
   nickname: string
+  departure_city: string
   city: string
   start_date: string
   end_date: string
   travel_days: number
+  intercity_transportation: string
   transportation: string
   accommodation: string
   preferences: string[]

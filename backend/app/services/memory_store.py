@@ -4,10 +4,14 @@ import hashlib
 import json
 import re
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, List
+
+from .agent_output_logger import log_event, timed_event
 
 
 def now_iso() -> str:
@@ -23,6 +27,10 @@ class MemoryStore:
         self.runtime_root = runtime_root or backend_root / "runtime_data"
         self.tasks_dir = self.runtime_root / "tasks"
         self.users_dir = self.runtime_root / "users"
+        self._task_cache: Dict[str, Dict[str, Any]] = {}
+        self._task_revisions: Dict[str, int] = {}
+        self._task_cache_lock = RLock()
+        self._task_write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="task-memory-writer")
         self.ensure_runtime_dirs()
 
     def ensure_runtime_dirs(self) -> None:
@@ -98,6 +106,21 @@ class MemoryStore:
         self._write_markdown_atomic(path, self.render_user_markdown(record))
 
     def read_task(self, task_id: str) -> Dict[str, Any]:
+        with self._task_cache_lock:
+            cached = self._task_cache.get(task_id)
+            if cached is not None:
+                return self._public_task_record(cached)
+        task = self._read_task_from_disk(task_id)
+        with self._task_cache_lock:
+            if task_id not in self._task_cache:
+                revision = self._task_revisions.get(task_id, 0)
+                task["_memory_revision"] = revision
+                self._task_revisions[task_id] = revision
+                self._task_cache[task_id] = deepcopy(task)
+                return self._public_task_record(task)
+            return self._public_task_record(self._task_cache[task_id])
+
+    def _read_task_from_disk(self, task_id: str) -> Dict[str, Any]:
         path = self._task_path(task_id)
         text = path.read_text(encoding="utf-8")
         front_matter = self._extract_front_matter(text)
@@ -121,14 +144,29 @@ class MemoryStore:
         }
 
     def write_task(self, task_record: Dict[str, Any]) -> None:
-        path = self._task_path(task_record["task_id"])
-        task_record["updated_at"] = now_iso()
-        self._write_markdown_atomic(path, self.render_task_markdown(task_record))
+        task_id, revision, snapshot = self._cache_task_snapshot(task_record)
+        self._persist_task_snapshot(task_id, revision, snapshot)
+
+    def write_task_async(self, task_record: Dict[str, Any]) -> Future:
+        task_id, revision, snapshot = self._cache_task_snapshot(task_record)
+        return self._submit_task_snapshot(task_id, revision, snapshot)
+
+    def patch_task_fields_async(self, task_id: str, fields: Dict[str, Any]) -> Future:
+        with self._task_cache_lock:
+            base = self._task_cache.get(task_id)
+            if base is None:
+                base = self._read_task_from_disk(task_id)
+            snapshot = deepcopy(base)
+            for key, value in fields.items():
+                snapshot[key] = deepcopy(value)
+            snapshot["task_id"] = task_id
+        task_id, revision, snapshot = self._cache_task_snapshot(snapshot)
+        return self._submit_task_snapshot(task_id, revision, snapshot)
 
     def append_task_conversation(self, task_id: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         task = self.read_task(task_id)
         task.setdefault("conversation_log", []).extend(entries)
-        self.write_task(task)
+        self.write_task_async(task)
         return task
 
     def extract_json_section(self, markdown: str, section_name: str, default: Any) -> Any:
@@ -211,6 +249,53 @@ class MemoryStore:
         tmp_path.write_text(content, encoding="utf-8")
         tmp_path.replace(path)
 
+    def _cache_task_snapshot(self, task_record: Dict[str, Any]) -> tuple[str, int, Dict[str, Any]]:
+        task_id = task_record["task_id"]
+        snapshot = deepcopy(task_record)
+        snapshot["updated_at"] = now_iso()
+        with self._task_cache_lock:
+            revision = self._task_revisions.get(task_id, 0) + 1
+            self._task_revisions[task_id] = revision
+            snapshot["_memory_revision"] = revision
+            self._task_cache[task_id] = deepcopy(snapshot)
+        return task_id, revision, snapshot
+
+    def _submit_task_snapshot(self, task_id: str, revision: int, snapshot: Dict[str, Any]) -> Future:
+        future = self._task_write_executor.submit(self._persist_task_snapshot, task_id, revision, snapshot)
+        future.add_done_callback(lambda done: self._log_async_write_failure(task_id, revision, done))
+        return future
+
+    def _persist_task_snapshot(self, task_id: str, revision: int, snapshot: Dict[str, Any]) -> None:
+        with self._task_cache_lock:
+            latest_revision = self._task_revisions.get(task_id, revision)
+            if revision < latest_revision:
+                log_event(
+                    "task_memory.write_skipped_stale_revision",
+                    {"task_id": task_id, "revision": revision, "latest_revision": latest_revision},
+                )
+                return
+        with timed_event("task_memory.write_task_snapshot", {"task_id": task_id, "revision": revision}):
+            self._write_markdown_atomic(self._task_path(task_id), self.render_task_markdown(snapshot))
+
+    def _log_async_write_failure(self, task_id: str, revision: int, future: Future) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.result()
+        except Exception as exc:
+            log_event(
+                "task_memory.async_write_error",
+                {"task_id": task_id, "revision": revision, "error": repr(exc)},
+            )
+
+    def _public_task_record(self, task_record: Dict[str, Any]) -> Dict[str, Any]:
+        record = deepcopy(task_record)
+        record.pop("_memory_revision", None)
+        return record
+
+    def shutdown_async_writes(self, wait: bool = True) -> None:
+        self._task_write_executor.shutdown(wait=wait, cancel_futures=not wait)
+
     def _merge_profile(self, current: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         merged = deepcopy(current)
         for key in ("preferences", "dislikes", "constraints", "notes"):
@@ -236,3 +321,8 @@ def get_memory_store() -> MemoryStore:
     if _memory_store is None:
         _memory_store = MemoryStore()
     return _memory_store
+
+
+def shutdown_memory_store() -> None:
+    if _memory_store is not None:
+        _memory_store.shutdown_async_writes(wait=True)

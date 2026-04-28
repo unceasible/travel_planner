@@ -26,9 +26,24 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000"
 
     amap_api_key: str = ""
+    amap_route_max_workers: int = 1
+    amap_route_min_interval_seconds: float = 0.35
+    amap_route_rate_limit_backoff_seconds: float = 1.2
+    amap_route_max_retries: int = 2
+    amap_route_mcp_fallback_enabled: bool = False
+    hotel_min_candidates: int = 6
+    hotel_ideal_distance_to_main_cluster_m: int = 8000
+    hotel_hard_distance_to_main_cluster_m: int = 15000
+    hotel_supplement_enabled: bool = True
+    hotel_max_supplement_queries: int = 4
+    tuniu_hotel_limit: int = 20
+    tuniu_hotel_supplement_enabled: bool = True
+    tuniu_hotel_max_supplement_queries: int = 5
     tuniu_api_key: str = ""
     tuniu_member_key: str = ""
     tuniu_mcp_url: str = "https://openapi.tuniu.cn/mcp/hotel"
+    tuniu_flight_mcp_url: str = "https://openapi.tuniu.cn/mcp/flight"
+    tuniu_train_mcp_url: str = "https://openapi.tuniu.cn/mcp/train"
     unsplash_access_key: str = ""
     unsplash_secret_key: str = ""
 

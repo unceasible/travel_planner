@@ -28,6 +28,7 @@ ALLOWED_DOMAINS = {
     "hotels",
     "restaurants",
     "transportation",
+    "intercity_transport",
     "schedule",
     "budget",
     "weather",
@@ -189,6 +190,17 @@ INTENT_RULES = [
     IntentRule("replace_transportation", "modify", ["transportation"], "replace", 0.92, [
         r"(交通|出行|路线).{0,12}(换|改|调整)",
         r"改成.{0,4}(自驾|公共交通|公交|地铁|步行|打车|混合)",
+    ]),
+    IntentRule("replan_departure_city", "replan", ["intercity_transport"], "replace", 0.94, [
+        r"从[一-龥A-Za-z]{2,24}出发",
+        r"(出发城市|始发城市).{0,10}(改|换|调整)",
+    ]),
+    IntentRule("replan_intercity_transport", "replan", ["intercity_transport"], "replace", 0.93, [
+        r"(机票|航班|飞机|火车|高铁|动车|列车|大交通).{0,12}(查|看|改|换|推荐|安排)",
+        r"(查|看|看看|查询|搜索|搜|推荐|安排).{0,12}(机票|航班|飞机|火车|高铁|动车|列车|大交通)",
+        r"(这次|这回|本次)?.{0,4}(坐|乘|搭).{0,6}(飞机|火车|高铁|动车|列车)",
+        r"(改成|换成|坐).{0,6}(飞机|火车|高铁|动车)",
+        r"(自驾过去|自驾往返|开车过去|开车去)",
     ]),
     IntentRule("decrease_schedule", "modify", ["schedule"], "decrease", 0.88, [
         r"(太累|太赶|轻松|慢一点|少走路|休闲)",

@@ -14,7 +14,7 @@ from hello_agents import SimpleAgent
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
-from ..models.schemas import Attraction, DayPlan, Location, Meal, TripPlan, TripRequest
+from ..models.schemas import Attraction, DayPlan, Hotel, IntercityTransportPlan, Location, Meal, TripPlan, TripRequest
 from ..services.agent_output_logger import log_event, log_full_output, timed_event
 from ..services.amap_tool_pool import AmapWorkerPool
 from ..services.llm_service import get_llm, get_openai_client, get_openai_model
@@ -289,25 +289,216 @@ class MultiAgentTripPlanner:
         return self._safe_run("weather", query)
 
     def search_hotels(self, city: str, accommodation: str, start_date: str = "", end_date: str = "") -> str:
+        collected: List[Dict[str, Any]] = []
         if start_date and end_date:
             try:
-                text = get_tuniu_hotel_service().search_hotels(
+                tuniu_service = get_tuniu_hotel_service()
+                text = tuniu_service.search_hotels(
                     city=city,
                     accommodation=accommodation,
                     start_date=start_date,
                     end_date=end_date,
+                    limit=self._tuniu_hotel_limit(),
                 )
                 data = json.loads(text)
+                collected = self._extract_candidate_objects(text)
                 if data.get("pois"):
                     self._print_full_output_block("agent_result:hotels:tuniu", text)
-                    return text
-                log_event("hotel_search_fallback_to_amap", {"reason": "tuniu_empty", "city": city})
+                if self._hotel_needs_supplement(collected) and self._tuniu_hotel_supplement_enabled():
+                    before = len(collected)
+                    collected.extend(
+                        self._search_tuniu_hotel_supplements(
+                            tuniu_service,
+                            city,
+                            accommodation,
+                            start_date,
+                            end_date,
+                            collected,
+                        )
+                    )
+                    collected = self._dedupe_raw_candidates(collected)
+                    log_event(
+                        "tuniu_hotel_merge_result",
+                        {
+                            "city": city,
+                            "primary_count": before,
+                            "merged_count": len(collected),
+                            "deduped_count": len(collected),
+                            "target_count": self._hotel_min_candidates(),
+                        },
+                    )
+                if collected and not self._hotel_needs_supplement(collected):
+                    result = json.dumps({"pois": collected}, ensure_ascii=False)
+                    self._print_full_output_block("agent_result:hotels:tuniu_supplemented", result)
+                    return result
+                if collected:
+                    log_event(
+                        "hotel_search_fallback_to_amap",
+                        {
+                            "reason": "tuniu_too_few",
+                            "city": city,
+                            "candidate_count": len(collected),
+                            "target_count": self._hotel_min_candidates(),
+                        },
+                    )
+                else:
+                    log_event("hotel_search_fallback_to_amap", {"reason": "tuniu_empty", "city": city})
             except Exception as exc:
                 log_event("tuniu_hotel_error", {"stage": "search", "city": city, "error": repr(exc)})
                 log_event("hotel_search_fallback_to_amap", {"reason": "tuniu_error", "city": city})
         else:
             log_event("hotel_search_fallback_to_amap", {"reason": "missing_dates", "city": city})
+        if self._hotel_supplement_enabled():
+            collected.extend(self._search_hotel_supplements(city, accommodation, collected))
+        collected = self._dedupe_raw_candidates(collected)
+        log_event(
+            "hotel_search_merge_result",
+            {
+                "city": city,
+                "merged_count": len(collected),
+                "target_count": self._hotel_min_candidates(),
+                "amap_supplement_used": self._hotel_supplement_enabled(),
+            },
+        )
+        if collected:
+            result = json.dumps({"pois": collected}, ensure_ascii=False)
+            self._print_full_output_block("agent_result:hotels:supplemented", result)
+            return result
         return self._safe_run("hotels", f"请搜索{city}的{accommodation}酒店。")
+
+    def _tuniu_hotel_limit(self) -> int:
+        return max(1, int(getattr(self.settings, "tuniu_hotel_limit", 20) or 20))
+
+    def _tuniu_hotel_supplement_enabled(self) -> bool:
+        return bool(getattr(self.settings, "tuniu_hotel_supplement_enabled", True))
+
+    def _tuniu_hotel_max_supplement_queries(self) -> int:
+        return max(0, int(getattr(self.settings, "tuniu_hotel_max_supplement_queries", 5) or 0))
+
+    def _hotel_supplement_enabled(self) -> bool:
+        return bool(getattr(self.settings, "hotel_supplement_enabled", True))
+
+    def _hotel_min_candidates(self) -> int:
+        return max(1, int(getattr(self.settings, "hotel_min_candidates", 6) or 6))
+
+    def _hotel_max_supplement_queries(self) -> int:
+        return max(0, int(getattr(self.settings, "hotel_max_supplement_queries", 4) or 0))
+
+    def _hotel_needs_supplement(self, candidates: List[Dict[str, Any]]) -> bool:
+        return len(candidates or []) < self._hotel_min_candidates()
+
+    def _search_tuniu_hotel_supplements(
+        self,
+        tuniu_service: Any,
+        city: str,
+        accommodation: str,
+        start_date: str,
+        end_date: str,
+        existing: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        supplements: List[Dict[str, Any]] = []
+        target = self._hotel_min_candidates()
+        keywords = self._tuniu_hotel_supplement_keywords(accommodation)[: self._tuniu_hotel_max_supplement_queries()]
+        for keyword in keywords:
+            merged = self._dedupe_raw_candidates([*(existing or []), *supplements])
+            if len(merged) >= target:
+                break
+            try:
+                text = tuniu_service.search_hotels(
+                    city=city,
+                    accommodation=accommodation,
+                    start_date=start_date,
+                    end_date=end_date,
+                    keyword=keyword,
+                    limit=self._tuniu_hotel_limit(),
+                )
+                round_candidates = self._extract_candidate_objects(text)
+                supplements.extend(round_candidates)
+                merged_after = self._dedupe_raw_candidates([*(existing or []), *supplements])
+                log_event(
+                    "tuniu_hotel_supplement_round",
+                    {
+                        "city": city,
+                        "keyword": keyword,
+                        "limit": self._tuniu_hotel_limit(),
+                        "returned_count": len(round_candidates),
+                        "merged_count": len(merged_after),
+                        "deduped_count": len(merged_after),
+                        "target_count": target,
+                    },
+                )
+            except Exception as exc:
+                log_event(
+                    "tuniu_hotel_error",
+                    {"stage": "supplement", "city": city, "keyword": keyword, "error": repr(exc)},
+                )
+        return supplements
+
+    def _tuniu_hotel_supplement_keywords(self, accommodation: str) -> List[str]:
+        accommodation = str(accommodation or "").strip()
+        keywords: List[str] = []
+        if any(token in accommodation for token in ("经济", "便宜", "省钱")):
+            keywords.append("快捷酒店")
+        elif any(token in accommodation for token in ("舒适", "中档")):
+            keywords.append("商务酒店")
+        elif any(token in accommodation for token in ("豪华", "高端", "五星")):
+            keywords.append("高星酒店")
+        elif "民宿" in accommodation:
+            keywords.append("民宿")
+        keywords.extend(["市中心酒店", "火车站酒店", "地铁站酒店", "景点附近酒店"])
+        return self._unique_nonempty_texts(keywords)
+
+    def _search_hotel_supplements(self, city: str, accommodation: str, existing: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        supplements: List[Dict[str, Any]] = []
+        target = self._hotel_min_candidates()
+        for keyword in self._hotel_supplement_keywords(city, accommodation)[: self._hotel_max_supplement_queries()]:
+            if len(existing) + len(supplements) >= target:
+                break
+            log_event("hotel_search_fallback_to_amap", {"reason": "amap_supplement_used", "city": city, "keyword": keyword})
+            text = self._safe_run("hotels", f"请搜索{city}的{keyword}。返回名称、地址和坐标。")
+            supplements.extend(self._extract_candidate_objects(text))
+        log_event(
+            "hotel_supplement_result",
+            {
+                "city": city,
+                "existing_count": len(existing or []),
+                "supplement_count": len(supplements),
+            },
+        )
+        return supplements
+
+    def _hotel_supplement_keywords(self, city: str, accommodation: str) -> List[str]:
+        accommodation = str(accommodation or "").strip()
+        keywords: List[str] = []
+        if accommodation:
+            keywords.append(accommodation)
+        keywords.extend(["市中心酒店", "火车站酒店", "地铁站酒店", "景点附近酒店"])
+        return self._unique_nonempty_texts(keywords)
+
+    def _dedupe_raw_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates or []:
+            if not isinstance(candidate, dict):
+                continue
+            key = self._raw_candidate_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(candidate)
+        return result
+
+    def _raw_candidate_key(self, candidate: Dict[str, Any]) -> str:
+        poi_id = str(candidate.get("id") or candidate.get("poi_id") or "").strip()
+        if poi_id:
+            return f"id:{poi_id}"
+        name = self._normalize_name(str(candidate.get("name") or ""))
+        address = self._normalize_name(str(candidate.get("address") or ""))
+        location = self._coerce_location(candidate.get("location"))
+        loc_key = ""
+        if location:
+            loc_key = f"{location['longitude']:.5f},{location['latitude']:.5f}"
+        return f"name:{name}|address:{address}|loc:{loc_key}"
 
     def search_restaurants(self, city: str, preference_hint: str = "") -> str:
         keyword = preference_hint or "本地特色餐厅"
@@ -337,8 +528,12 @@ class MultiAgentTripPlanner:
         user_profile_summary: str = "",
         extra_requirements: str = "",
         conversation_history: Optional[List[Dict[str, Any]]] = None,
+        intercity_transport: Any = None,
+        reflection_feedback: str = "",
     ) -> TripPlan:
         candidate_context = self.build_candidate_context(attractions, weather, hotels, restaurants, request.city)
+        intercity_plan = self._coerce_intercity_transport(intercity_transport)
+        candidate_context["intercity_transport"] = intercity_plan.model_dump() if intercity_plan else None
         candidate_context["attraction_candidates"] = self._rank_candidates(
             list(candidate_context.get("attraction_candidates", []) or []),
             "attraction",
@@ -354,20 +549,31 @@ class MultiAgentTripPlanner:
             "restaurant",
             request,
         )
-        planning_constraints = self.build_initial_planning_constraints(request)
+        planning_constraints = self.build_initial_planning_constraints(request, intercity_plan)
         self._attach_attraction_geo_clusters(candidate_context, planning_constraints)
+        self._supplement_hotels_if_all_rejected(request, candidate_context, planning_constraints)
+        reflection_instruction = (
+            "ReflectionAgent has reviewed the previous plan and found quality issues. "
+            "You must fix the issues in reflection_feedback while still obeying candidate-pool, hotel safety, budget, route, and user preference constraints. "
+            if reflection_feedback
+            else ""
+        )
         draft = self._parse_structured_plan(
             (
                 "你是旅行规划专家。你只能从候选池中选择酒店、景点、餐饮。每个选择必须使用 source_candidate_id。"
                 "酒店信息只用于检索、展示和预算参考，严禁生成、建议或引导任何下单、预订、支付、锁房或创建订单行为。"
                 "必须遵守 planning_constraints：候选足够时，每天景点数达到 min_attractions_per_day，尽量接近 "
                 "target_attractions_per_day，且不超过 max_attractions_per_day。每天必须包含 breakfast、lunch、dinner。"
+                "如果 intercity_schedule_constraints 存在，必须根据去程到达时间和返程出发时间降低第一天/最后一天行程密度。"
+                "不要编造大交通班次、航班号或车次，只能引用 candidates.intercity_transport 中的检索结果。"
+                "如果 form.transportation 和 form.intercity_transportation 都不是“自驾”，禁止建议自驾、开车、驾车或租车；用户画像中的旧自驾偏好不能覆盖本次表单交通选择。"
                 "景点只能使用 attraction_candidates，酒店只能使用 hotel_candidates，餐饮只能使用 restaurant_candidates；"
                 "不要把景点当作餐厅。午餐和晚餐优先选择真实餐厅，早餐可以选择真实餐厅或酒店附近简餐。"
                 "同一天景点必须优先按地理邻近性分组和排序，尽量减少酒店到景点、景点到景点、景点回酒店的移动距离。"
                 "当景点数量与路线紧凑冲突时，优先保证路线合理，不要为了凑数量安排过远景点。"
                 "如果 candidates.attraction_geo_clusters 或 candidates.attraction_candidate_groups 存在，优先从同一个 cluster/group 中选择同一天景点；"
                 "候选中的 candidate_score、meal_suitability、nearby_cluster_id、hotel_score 是后端规则计算出的质量提示，应优先参考。"
+                f"{reflection_instruction}"
             ),
             {
                 "priority_rules": CONTEXT_PRIORITY_RULES,
@@ -375,11 +581,14 @@ class MultiAgentTripPlanner:
                 "user_profile": user_profile_summary,
                 "form": request.model_dump(),
                 "extra_requirements": extra_requirements,
+                "reflection_feedback": reflection_feedback,
                 "planning_constraints": planning_constraints,
                 "candidates": candidate_context,
             },
         )
         plan = self._draft_to_trip_plan(draft, request.model_dump(), candidate_context)
+        plan.departure_city = request.departure_city or ""
+        plan.intercity_transport = intercity_plan
         return self._ensure_initial_plan_density(plan, request.model_dump(), candidate_context, planning_constraints)
 
     def revise_plan(
@@ -390,6 +599,7 @@ class MultiAgentTripPlanner:
         patch_context: Dict[str, Any],
         user_profile_summary: str = "",
         conversation_history: Optional[List[Dict[str, Any]]] = None,
+        reflection_feedback: str = "",
     ) -> TripPlan:
         candidate_context = self.build_candidate_context(
             patch_context.get("attractions", ""),
@@ -399,7 +609,15 @@ class MultiAgentTripPlanner:
             form_snapshot.get("city", ""),
         )
         draft = self._parse_structured_plan(
-            "你是旅行计划修改专家。请根据用户的新要求调整当前计划，尽量保留未受影响的酒店、餐饮和行程信息。酒店信息只用于检索、展示和预算参考，严禁生成、建议或引导任何下单、预订、支付、锁房或创建订单行为。",
+            (
+                "你是旅行计划修改专家。请根据用户的新要求调整当前计划，尽量保留未受影响的酒店、餐饮和行程信息。酒店信息只用于检索、展示和预算参考，严禁生成、建议或引导任何下单、预订、支付、锁房或创建订单行为。"
+                "如果 form_snapshot.transportation 和 form_snapshot.intercity_transportation 都不是“自驾”，禁止建议自驾、开车、驾车或租车；用户画像中的旧自驾偏好不能覆盖本次表单交通选择。"
+                + (
+                    "ReflectionAgent has reviewed the previous revision and found quality issues. Fix reflection_feedback without breaking unchanged requirements."
+                    if reflection_feedback
+                    else ""
+                )
+            ),
             {
                 "priority_rules": CONTEXT_PRIORITY_RULES,
                 "conversation_history": conversation_history or [],
@@ -407,6 +625,7 @@ class MultiAgentTripPlanner:
                 "current_plan": current_plan.model_dump(),
                 "form_snapshot": form_snapshot,
                 "user_message": user_message,
+                "reflection_feedback": reflection_feedback,
                 "patch_context": patch_context,
                 "candidates": candidate_context,
             },
@@ -422,6 +641,7 @@ class MultiAgentTripPlanner:
         patch_context: Dict[str, Any],
         user_profile_summary: str = "",
         conversation_history: Optional[List[Dict[str, Any]]] = None,
+        reflection_feedback: str = "",
     ) -> TripPlan:
         candidate_context = self.build_candidate_context(
             patch_context.get("attractions", ""),
@@ -444,6 +664,7 @@ class MultiAgentTripPlanner:
                 "current_plan": current_plan.model_dump(),
                 "form_snapshot": form_snapshot,
                 "user_message": user_message,
+                "reflection_feedback": reflection_feedback,
                 "patch_context": patch_context,
                 "candidates": candidate_context,
             }
@@ -525,6 +746,7 @@ class MultiAgentTripPlanner:
             )
 
         return TripPlan(
+            departure_city=str(form_snapshot.get("departure_city", "")),
             city=city,
             start_date=start_date.strftime("%Y-%m-%d"),
             end_date=end_date_raw,
@@ -542,9 +764,32 @@ class MultiAgentTripPlanner:
             "weather_raw": weather,
         }
 
-    def build_initial_planning_constraints(self, request: TripRequest) -> Dict[str, Any]:
+    def _coerce_intercity_transport(self, value: Any) -> Optional[IntercityTransportPlan]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, IntercityTransportPlan):
+            return value
+        try:
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                return IntercityTransportPlan.model_validate(value)
+        except Exception as exc:
+            log_event("intercity_transport_parse_error", {"error": repr(exc)})
+        return None
+
+    def build_initial_planning_constraints(
+        self,
+        request: TripRequest,
+        intercity_transport: Optional[IntercityTransportPlan] = None,
+    ) -> Dict[str, Any]:
         target_candidates = self._dynamic_candidate_target(request.travel_days)
         relaxed = self._is_relaxed_trip(request)
+        intercity_constraints = (
+            intercity_transport.schedule_constraints
+            if intercity_transport and isinstance(intercity_transport.schedule_constraints, dict)
+            else {}
+        )
         return {
             "target_attraction_candidates": target_candidates,
             "target_restaurant_candidates": target_candidates,
@@ -562,10 +807,13 @@ class MultiAgentTripPlanner:
                 "order_attractions_to_reduce_travel_distance": True,
                 "ideal_max_same_day_attraction_distance_m": int(SAME_DAY_IDEAL_MAX_DISTANCE_M),
                 "hard_max_same_day_attraction_distance_m": int(SAME_DAY_HARD_MAX_DISTANCE_M),
+                "hotel_ideal_distance_to_main_cluster_m": int(getattr(self.settings, "hotel_ideal_distance_to_main_cluster_m", 8000) or 8000),
+                "hotel_hard_distance_to_main_cluster_m": int(getattr(self.settings, "hotel_hard_distance_to_main_cluster_m", 15000) or 15000),
                 "prefer_route_compactness_over_filling_attraction_count": True,
                 "use_attraction_geo_clusters_when_available": True,
             },
             "relaxed_pace": relaxed,
+            "intercity_schedule_constraints": intercity_constraints,
         }
 
     def _attach_attraction_geo_clusters(
@@ -641,23 +889,7 @@ class MultiAgentTripPlanner:
             cluster_centers,
             key=lambda item: next((cluster.get("size", 0) for cluster in clusters if cluster.get("cluster_id") == item[0]), 0),
         )
-        for hotel in candidate_context.get("hotel_candidates", []) or []:
-            location = self._candidate_location(hotel)
-            if self._is_zero_location(location):
-                hotel["geo_quality"] = "missing"
-                hotel["distance_to_main_cluster_m"] = None
-                hotel["hotel_score"] = hotel.get("candidate_score", 0)
-                continue
-            distance = self._distance_between_locations(location, main_center)
-            hotel["geo_quality"] = "good"
-            hotel["distance_to_main_cluster_m"] = round(distance, 2)
-            hotel["nearby_cluster_id"] = main_cluster_id
-            hotel["hotel_score"] = round(float(hotel.get("candidate_score", 0)) + max(0.0, 12.0 - distance / 1500.0), 2)
-        candidate_context["hotel_candidates"] = sorted(
-            candidate_context.get("hotel_candidates", []) or [],
-            key=lambda item: item.get("hotel_score", item.get("candidate_score", 0)) or 0,
-            reverse=True,
-        )
+        self._apply_hotel_geo_constraints(candidate_context, main_cluster_id, main_center)
 
         for restaurant in candidate_context.get("restaurant_candidates", []) or []:
             location = self._candidate_location(restaurant)
@@ -678,6 +910,133 @@ class MultiAgentTripPlanner:
                 item.get("distance_to_nearby_cluster_m") if item.get("distance_to_nearby_cluster_m") is not None else float("inf"),
                 -(item.get("candidate_score", 0) or 0),
             ),
+        )
+
+    def _apply_hotel_geo_constraints(
+        self,
+        candidate_context: Dict[str, Any],
+        main_cluster_id: str,
+        main_center: Location,
+    ) -> None:
+        ideal = float(getattr(self.settings, "hotel_ideal_distance_to_main_cluster_m", 8000) or 8000)
+        hard = float(getattr(self.settings, "hotel_hard_distance_to_main_cluster_m", 15000) or 15000)
+        eligible: List[Dict[str, Any]] = []
+        rejected = list(candidate_context.get("rejected_hotel_candidates") or [])
+        rejected_this_pass: List[Dict[str, Any]] = []
+        for hotel in candidate_context.get("hotel_candidates", []) or []:
+            item = dict(hotel)
+            location = self._candidate_location(item)
+            base_score = float(item.get("candidate_score", 0) or 0)
+            if self._is_zero_location(location):
+                item["geo_quality"] = "missing"
+                item["hotel_geo_status"] = "missing_geo"
+                item["distance_to_main_cluster_m"] = None
+                item["hotel_score"] = round(base_score - 30.0, 2)
+                rejected.append(item)
+                rejected_this_pass.append(item)
+                continue
+            distance = self._distance_between_locations(location, main_center)
+            item["geo_quality"] = "good"
+            item["distance_to_main_cluster_m"] = round(distance, 2)
+            item["nearby_cluster_id"] = main_cluster_id
+            if distance > hard:
+                item["hotel_geo_status"] = "too_far_from_main_cluster"
+                item["hotel_score"] = round(base_score - 40.0, 2)
+                rejected.append(item)
+                rejected_this_pass.append(item)
+                continue
+            if distance <= ideal:
+                item["hotel_geo_status"] = "near_main_cluster"
+                geo_bonus = 24.0
+            else:
+                item["hotel_geo_status"] = "acceptable_main_cluster_distance"
+                geo_bonus = 10.0
+            item["hotel_score"] = round(base_score + geo_bonus + max(0.0, 8.0 - distance / 2000.0), 2)
+            eligible.append(item)
+        candidate_context["hotel_candidates"] = sorted(
+            eligible,
+            key=lambda item: item.get("hotel_score", item.get("candidate_score", 0)) or 0,
+            reverse=True,
+        )
+        candidate_context["rejected_hotel_candidates"] = sorted(
+            rejected,
+            key=lambda item: item.get("hotel_score", item.get("candidate_score", 0)) or 0,
+            reverse=True,
+        )
+        log_event(
+            "hotel_geo_constraints",
+            {
+                "eligible_count": len(candidate_context["hotel_candidates"]),
+                "rejected_count": len(candidate_context["rejected_hotel_candidates"]),
+                "ideal_distance_m": ideal,
+                "hard_distance_m": hard,
+                "top_eligible": [
+                    {
+                        "name": item.get("name", ""),
+                        "distance_to_main_cluster_m": item.get("distance_to_main_cluster_m"),
+                        "hotel_score": item.get("hotel_score"),
+                    }
+                    for item in candidate_context["hotel_candidates"][:5]
+                ],
+            },
+        )
+        tuniu_far_rejections = [
+            item
+            for item in rejected_this_pass
+            if item.get("hotel_geo_status") == "too_far_from_main_cluster"
+            and str(item.get("price_source") or "") in {TUNIU_DETAIL_PRICE_SOURCE, TUNIU_LOWEST_PRICE_SOURCE}
+        ]
+        if not candidate_context["hotel_candidates"] and tuniu_far_rejections:
+            log_event(
+                "hotel_search_fallback_to_amap",
+                {
+                    "reason": "tuniu_all_far",
+                    "rejected_count": len(tuniu_far_rejections),
+                    "hard_distance_m": hard,
+                    "top_rejected": [
+                        {
+                            "name": item.get("name", ""),
+                            "distance_to_main_cluster_m": item.get("distance_to_main_cluster_m"),
+                        }
+                        for item in tuniu_far_rejections[:5]
+                    ],
+                },
+            )
+
+    def _supplement_hotels_if_all_rejected(
+        self,
+        request: TripRequest,
+        candidate_context: Dict[str, Any],
+        planning_constraints: Dict[str, Any],
+    ) -> None:
+        if not self._hotel_supplement_enabled():
+            return
+        if candidate_context.get("hotel_candidates") or not candidate_context.get("rejected_hotel_candidates"):
+            return
+        supplements = self._search_hotel_supplements(request.city, request.accommodation, [])
+        normalized = [
+            self._normalize_candidate_record(item, "hotel", index)
+            for index, item in enumerate(supplements)
+            if isinstance(item, dict)
+        ]
+        additions = [item for item in normalized if item]
+        if not additions:
+            return
+        existing = list(candidate_context.get("hotel_candidates") or [])
+        existing.extend(additions)
+        candidate_context["hotel_candidates"] = self._rank_candidates(existing, "hotel", request)
+        self._annotate_candidates_with_geo_groups(
+            candidate_context,
+            list(candidate_context.get("attraction_geo_clusters") or []),
+        )
+        log_event(
+            "hotel_supplement_after_geo_rejection",
+            {
+                "city": request.city,
+                "added_count": len(additions),
+                "eligible_count": len(candidate_context.get("hotel_candidates") or []),
+                "rejected_count": len(candidate_context.get("rejected_hotel_candidates") or []),
+            },
         )
 
     def _infer_group_theme(self, names: List[Any]) -> str:
@@ -1214,6 +1573,7 @@ class MultiAgentTripPlanner:
                 "content": (
                     "You are updating attractions only. Return only a JSON patch for days[].attractions and optional days[].description. "
                     "Do not change or return hotel, meals, weather_info, budget, city, start_date, end_date, or overall_suggestions. "
+                    "If form_snapshot.transportation and form_snapshot.intercity_transportation are not 自驾, do not suggest 自驾, 开车, 驾车, or 租车 in day descriptions. "
                     f"Here is a valid example:\n{ATTRACTIONS_PATCH_FEW_SHOT}\n\n"
                     "Return only valid JSON. Do not use markdown code fences."
                 ),
@@ -1368,8 +1728,10 @@ class MultiAgentTripPlanner:
         )
         geo_repair = self._repair_selected_attractions_by_geo(plan, planning_constraints)
         far_route_warnings.extend(geo_repair.get("warnings", []))
+        self._apply_intercity_attraction_caps(plan, planning_constraints)
         for day in plan.days:
-            while len(day.attractions or []) < min_attractions and unused_attractions:
+            day_min_attractions = self._effective_min_attractions_for_day(day, plan, min_attractions, planning_constraints)
+            while len(day.attractions or []) < day_min_attractions and unused_attractions:
                 selection = self._select_nearest_attraction_candidate(day, unused_attractions, hard_max_distance)
                 if selection is None:
                     far_route_warnings.append(
@@ -1485,6 +1847,39 @@ class MultiAgentTripPlanner:
         )
         log_event("initial_meal_autofill", meal_autofill)
         return plan
+
+    def _effective_min_attractions_for_day(
+        self,
+        day: DayPlan,
+        plan: TripPlan,
+        default_min: int,
+        planning_constraints: Dict[str, Any],
+    ) -> int:
+        cap = self._intercity_attraction_cap_for_day(day.day_index, len(plan.days), planning_constraints)
+        if cap is None:
+            return default_min
+        return max(0, min(default_min, cap))
+
+    def _apply_intercity_attraction_caps(self, plan: TripPlan, planning_constraints: Dict[str, Any]) -> None:
+        for day in plan.days:
+            cap = self._intercity_attraction_cap_for_day(day.day_index, len(plan.days), planning_constraints)
+            if cap is not None and cap >= 0 and len(day.attractions or []) > cap:
+                day.attractions = list(day.attractions or [])[:cap]
+
+    def _intercity_attraction_cap_for_day(
+        self,
+        day_index: int,
+        day_count: int,
+        planning_constraints: Dict[str, Any],
+    ) -> Optional[int]:
+        constraints = planning_constraints.get("intercity_schedule_constraints") or {}
+        if not isinstance(constraints, dict):
+            return None
+        if day_index == 0 and constraints.get("first_day_max_attractions") is not None:
+            return int(constraints.get("first_day_max_attractions") or 0)
+        if day_index == max(day_count - 1, 0) and constraints.get("last_day_max_attractions") is not None:
+            return int(constraints.get("last_day_max_attractions") or 0)
+        return None
 
     def _candidate_to_attraction(self, candidate: Dict[str, Any]) -> Attraction:
         return Attraction(
@@ -1669,10 +2064,11 @@ class MultiAgentTripPlanner:
 
     def _candidate_location(self, candidate: Dict[str, Any]) -> Location:
         location = candidate.get("location") or {}
-        try:
-            return Location.model_validate(location)
-        except Exception:
+        point = self._read_location_pair(location)
+        if point is None:
             return Location(longitude=0.0, latitude=0.0)
+        lon, lat = point
+        return Location(longitude=lon, latitude=lat)
 
     def _select_nearest_attraction_candidate(
         self,
@@ -1762,13 +2158,12 @@ class MultiAgentTripPlanner:
         return result
 
     def _distance_between_locations(self, loc1: Any, loc2: Any) -> float:
-        try:
-            lon1 = float(getattr(loc1, "longitude", loc1["longitude"]))
-            lat1 = float(getattr(loc1, "latitude", loc1["latitude"]))
-            lon2 = float(getattr(loc2, "longitude", loc2["longitude"]))
-            lat2 = float(getattr(loc2, "latitude", loc2["latitude"]))
-        except Exception:
+        point1 = self._read_location_pair(loc1)
+        point2 = self._read_location_pair(loc2)
+        if point1 is None or point2 is None:
             return float("inf")
+        lon1, lat1 = point1
+        lon2, lat2 = point2
         radius = 6371000.0
         phi1 = math.radians(lat1)
         phi2 = math.radians(lat2)
@@ -1778,12 +2173,27 @@ class MultiAgentTripPlanner:
         return radius * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
     def _is_zero_location(self, location: Any) -> bool:
-        try:
-            lon = float(getattr(location, "longitude", location["longitude"]))
-            lat = float(getattr(location, "latitude", location["latitude"]))
-        except Exception:
+        point = self._read_location_pair(location)
+        if point is None:
             return True
+        lon, lat = point
         return abs(lon) < 0.000001 and abs(lat) < 0.000001
+
+    def _read_location_pair(self, location: Any) -> Optional[tuple[float, float]]:
+        if location is None:
+            return None
+        try:
+            if isinstance(location, dict):
+                lon = float(location.get("longitude"))
+                lat = float(location.get("latitude"))
+            elif hasattr(location, "longitude") and hasattr(location, "latitude"):
+                lon = float(getattr(location, "longitude"))
+                lat = float(getattr(location, "latitude"))
+            else:
+                return None
+        except Exception:
+            return None
+        return lon, lat
 
     def _place_key_from_attraction(self, attraction: Attraction) -> str:
         candidate = {
@@ -1858,6 +2268,7 @@ class MultiAgentTripPlanner:
         try:
             normalize_start = time.perf_counter()
             normalized = dict(data)
+            normalized["departure_city"] = str(normalized.get("departure_city") or form_snapshot.get("departure_city") or "")
             normalized["city"] = str(normalized.get("city") or form_snapshot.get("city") or "")
             normalized["start_date"] = str(normalized.get("start_date") or form_snapshot.get("start_date") or "")
             normalized["end_date"] = str(normalized.get("end_date") or form_snapshot.get("end_date") or "")
@@ -1869,6 +2280,8 @@ class MultiAgentTripPlanner:
             ]
             normalized["weather_info"] = self._normalize_weather(normalized.get("weather_info", []), normalized["days"])
             normalized["budget"] = normalized.get("budget") or {}
+            if "intercity_transport" not in normalized and candidate_context.get("intercity_transport"):
+                normalized["intercity_transport"] = candidate_context.get("intercity_transport")
             normalize_elapsed = round((time.perf_counter() - normalize_start) * 1000, 2)
             self._print_full_output_block("final_plan_after_coerce", json.dumps(normalized, ensure_ascii=False))
 
@@ -1876,6 +2289,7 @@ class MultiAgentTripPlanner:
             try:
                 with timed_event("planner.trip_plan_model_validate", {"days": len(normalized.get("days", []))}):
                     plan = TripPlan.model_validate(normalized)
+                plan = self._repair_plan_hotels_by_geo(plan, candidate_context)
                 validate_attempts.append(
                     {
                         "attempt": 1,
@@ -1912,6 +2326,127 @@ class MultiAgentTripPlanner:
                     "city": form_snapshot.get("city", ""),
                 },
             )
+
+    def _repair_plan_hotels_by_geo(self, plan: TripPlan, candidate_context: Dict[str, Any]) -> TripPlan:
+        eligible_hotels = list(candidate_context.get("hotel_candidates") or [])
+        rejected_hotels = list(candidate_context.get("rejected_hotel_candidates") or [])
+        hard = float(getattr(self.settings, "hotel_hard_distance_to_main_cluster_m", 15000) or 15000)
+        repairs: List[Dict[str, Any]] = []
+        for day in plan.days:
+            hotel = day.hotel
+            if not hotel:
+                continue
+            reason = ""
+            if self._is_placeholder_hotel(hotel):
+                reason = "placeholder_hotel"
+            elif self._hotel_matches_any_candidate(hotel, rejected_hotels):
+                reason = "selected_rejected_hotel"
+            distance = self._hotel_to_day_attractions_distance(hotel, day)
+            if not reason and distance is not None and distance > hard:
+                reason = "hotel_too_far_from_day_attractions"
+            if not reason:
+                continue
+            replacement = self._select_best_hotel_for_day(day, eligible_hotels)
+            if replacement:
+                day.hotel = self._candidate_to_hotel(replacement)
+                day.accommodation = day.hotel.type or day.accommodation
+                repairs.append(
+                    {
+                        "day_index": day.day_index,
+                        "reason": reason,
+                        "action": "replace",
+                        "old_hotel": hotel.name,
+                        "new_hotel": day.hotel.name,
+                        "distance_m": round(distance, 2) if distance is not None else None,
+                    }
+                )
+            else:
+                day.hotel = None
+                repairs.append(
+                    {
+                        "day_index": day.day_index,
+                        "reason": reason,
+                        "action": "clear",
+                        "old_hotel": hotel.name,
+                        "distance_m": round(distance, 2) if distance is not None else None,
+                    }
+                )
+        if repairs:
+            log_event("hotel_geo_repair", repairs)
+        return plan
+
+    def _is_placeholder_hotel(self, hotel: Hotel) -> bool:
+        name = self._normalize_name(str(hotel.name or ""))
+        address = str(hotel.address or "").strip()
+        price_source = str(hotel.price_source or "").strip()
+        placeholder_names = {
+            self._normalize_name(item)
+            for item in ("推荐酒店", "推荐住宿", "酒店", "住宿", "经济型酒店", "舒适型酒店", "recommended hotel")
+        }
+        missing_geo = not hotel.location or self._is_zero_location(hotel.location)
+        if not name or name in placeholder_names:
+            return True
+        return missing_geo and not address and price_source in {"llm_estimate", "estimate", ""}
+
+    def _hotel_matches_any_candidate(self, hotel: Hotel, candidates: List[Dict[str, Any]]) -> bool:
+        hotel_name = self._normalize_name(hotel.name)
+        hotel_address = self._normalize_name(hotel.address)
+        for candidate in candidates:
+            candidate_name = self._normalize_name(str(candidate.get("name") or ""))
+            candidate_address = self._normalize_name(str(candidate.get("address") or ""))
+            if candidate_name and candidate_name == hotel_name:
+                return True
+            if candidate_address and hotel_address and candidate_address == hotel_address:
+                return True
+        return False
+
+    def _hotel_to_day_attractions_distance(self, hotel: Hotel, day: DayPlan) -> Optional[float]:
+        if not hotel.location or self._is_zero_location(hotel.location):
+            return None
+        distances = [
+            self._distance_between_locations(hotel.location, attraction.location)
+            for attraction in (day.attractions or [])
+            if attraction.location and not self._is_zero_location(attraction.location)
+        ]
+        distances = [distance for distance in distances if math.isfinite(distance)]
+        if not distances:
+            return None
+        return min(distances)
+
+    def _select_best_hotel_for_day(self, day: DayPlan, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        anchors = [
+            attraction.location
+            for attraction in (day.attractions or [])
+            if attraction.location and not self._is_zero_location(attraction.location)
+        ]
+        best: Optional[Dict[str, Any]] = None
+        best_key: tuple[float, float] | None = None
+        for candidate in candidates:
+            location = self._candidate_location(candidate)
+            if self._is_zero_location(location):
+                continue
+            min_distance = min(
+                (self._distance_between_locations(location, anchor) for anchor in anchors),
+                default=float(candidate.get("distance_to_main_cluster_m") or 0),
+            )
+            key = (min_distance, -float(candidate.get("hotel_score", candidate.get("candidate_score", 0)) or 0))
+            if best is None or (best_key is not None and key < best_key) or best_key is None:
+                best = candidate
+                best_key = key
+        return best
+
+    def _candidate_to_hotel(self, candidate: Dict[str, Any]) -> Hotel:
+        return Hotel(
+            name=str(candidate.get("name") or "推荐酒店"),
+            address=str(candidate.get("address") or ""),
+            location=self._candidate_location(candidate),
+            price_range=str(candidate.get("price_range") or ""),
+            rating=str(candidate.get("rating") or ""),
+            distance=str(candidate.get("distance") or ""),
+            type=str(candidate.get("type") or "酒店"),
+            estimated_cost=self._parse_money(candidate.get("estimated_cost") or candidate.get("price_range") or 0),
+            price_source=str(candidate.get("price_source") or "estimate"),
+        )
 
     def _normalize_day(self, day: Dict[str, Any], idx: int, form_snapshot: Dict[str, Any], candidate_context: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(day)

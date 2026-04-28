@@ -26,7 +26,7 @@
         <div class="form-section">
           <div class="section-header">
             <span class="section-icon">📍</span>
-            <span class="section-title">目的地与日期</span>
+            <span class="section-title">出发地、目的地与日期</span>
           </div>
 
           <a-row :gutter="24">
@@ -48,6 +48,23 @@
               </a-form-item>
             </a-col>
             <a-col :span="6">
+              <a-form-item name="departure_city" :rules="[{ required: true, message: '请输入出发城市' }]">
+                <template #label>
+                  <span class="form-label">出发城市</span>
+                </template>
+                <a-input
+                  v-model:value="formData.departure_city"
+                  placeholder="例如: 天津"
+                  size="large"
+                  class="custom-input"
+                >
+                  <template #prefix>
+                    <span style="color: #1890ff;">🚉</span>
+                  </template>
+                </a-input>
+              </a-form-item>
+            </a-col>
+            <a-col :span="6">
               <a-form-item name="city" :rules="[{ required: true, message: '请输入目的地城市' }]">
                 <template #label>
                   <span class="form-label">目的地城市</span>
@@ -64,7 +81,20 @@
                 </a-input>
               </a-form-item>
             </a-col>
-            <a-col :span="5">
+            <a-col :span="6">
+              <a-form-item>
+                <template #label>
+                  <span class="form-label">旅行天数</span>
+                </template>
+                <div class="days-display-compact">
+                  <span class="days-value">{{ formData.travel_days }}</span>
+                  <span class="days-unit">天</span>
+                </div>
+              </a-form-item>
+            </a-col>
+          </a-row>
+          <a-row :gutter="24">
+            <a-col :span="12">
               <a-form-item name="start_date" :rules="[{ required: true, message: '请选择开始日期' }]">
                 <template #label>
                   <span class="form-label">开始日期</span>
@@ -78,7 +108,7 @@
                 />
               </a-form-item>
             </a-col>
-            <a-col :span="5">
+            <a-col :span="12">
               <a-form-item name="end_date" :rules="[{ required: true, message: '请选择结束日期' }]">
                 <template #label>
                   <span class="form-label">结束日期</span>
@@ -92,17 +122,6 @@
                 />
               </a-form-item>
             </a-col>
-            <a-col :span="2">
-              <a-form-item>
-                <template #label>
-                  <span class="form-label">旅行天数</span>
-                </template>
-                <div class="days-display-compact">
-                  <span class="days-value">{{ formData.travel_days }}</span>
-                  <span class="days-unit">天</span>
-                </div>
-              </a-form-item>
-            </a-col>
           </a-row>
         </div>
 
@@ -114,10 +133,23 @@
           </div>
 
           <a-row :gutter="24">
-            <a-col :span="8">
+            <a-col :span="6">
+              <a-form-item name="intercity_transportation">
+                <template #label>
+                  <span class="form-label">大交通偏好</span>
+                </template>
+                <a-select v-model:value="formData.intercity_transportation" size="large" class="custom-select">
+                  <a-select-option value="智能推荐">✨ 智能推荐</a-select-option>
+                  <a-select-option value="飞机">✈️ 飞机</a-select-option>
+                  <a-select-option value="火车">🚄 火车</a-select-option>
+                  <a-select-option value="自驾">🚗 自驾</a-select-option>
+                </a-select>
+              </a-form-item>
+            </a-col>
+            <a-col :span="6">
               <a-form-item name="transportation">
                 <template #label>
-                  <span class="form-label">交通方式</span>
+                  <span class="form-label">目的地内交通方式</span>
                 </template>
                 <a-select v-model:value="formData.transportation" size="large" class="custom-select">
                   <a-select-option value="公共交通">🚇 公共交通</a-select-option>
@@ -127,7 +159,7 @@
                 </a-select>
               </a-form-item>
             </a-col>
-            <a-col :span="8">
+            <a-col :span="6">
               <a-form-item name="accommodation">
                 <template #label>
                   <span class="form-label">住宿偏好</span>
@@ -140,7 +172,7 @@
                 </a-select>
               </a-form-item>
             </a-col>
-            <a-col :span="8">
+            <a-col :span="6">
               <a-form-item name="preferences">
                 <template #label>
                   <span class="form-label">旅行偏好</span>
@@ -240,10 +272,12 @@ const loadingStatus = ref('')
 
 const formData = reactive<TripFormState>({
   nickname: '',
+  departure_city: '',
   city: '',
   start_date: null,
   end_date: null,
   travel_days: 1,
+  intercity_transportation: '智能推荐',
   transportation: '公共交通',
   accommodation: '经济型酒店',
   preferences: [],
@@ -288,6 +322,14 @@ const handleSubmit = async () => {
     message.error('请输入昵称')
     return
   }
+  if (!formData.departure_city.trim()) {
+    message.error('请输入出发城市')
+    return
+  }
+  if (!formData.city.trim()) {
+    message.error('请输入目的地城市')
+    return
+  }
   if (!formData.start_date || !formData.end_date) {
     message.error('请选择日期')
     return
@@ -300,10 +342,12 @@ const handleSubmit = async () => {
   try {
     const requestData: TripFormData = {
       nickname: formData.nickname.trim(),
-      city: formData.city,
+      departure_city: formData.departure_city.trim(),
+      city: formData.city.trim(),
       start_date: formData.start_date.format('YYYY-MM-DD'),
       end_date: formData.end_date.format('YYYY-MM-DD'),
       travel_days: formData.travel_days,
+      intercity_transportation: formData.intercity_transportation,
       transportation: formData.transportation,
       accommodation: formData.accommodation,
       preferences: formData.preferences,

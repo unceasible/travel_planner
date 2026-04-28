@@ -12,6 +12,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+pytest-cache-files-*/
 .coverage
 htmlcov/
 
@@ -32,3 +33,5 @@ backend/*.log
 .env
 .env.local
 *.log
+/package-lock.json
+backend/test_log

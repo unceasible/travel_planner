@@ -68,8 +68,12 @@
           <!-- 左侧:行程概览和预算明细 -->
           <div class="left-info">
             <!-- 行程概览 -->
-            <a-card id="overview" :title="`${tripPlan.city}旅行计划`" :bordered="false" class="overview-card">
+            <a-card id="overview" :title="tripTitle" :bordered="false" class="overview-card">
               <div class="overview-content">
+                <div class="info-item" v-if="tripPlan.departure_city">
+                  <span class="info-label">🚉 出发:</span>
+                  <span class="info-value">{{ tripPlan.departure_city }} -> {{ tripPlan.city }}</span>
+                </div>
                 <div class="info-item">
                   <span class="info-label">📅 日期:</span>
                   <span class="info-value">{{ tripPlan.start_date }} 至 {{ tripPlan.end_date }}</span>
@@ -78,6 +82,49 @@
                   <span class="info-label">💡 建议:</span>
                   <span class="info-value">{{ tripPlan.overall_suggestions }}</span>
                 </div>
+              </div>
+            </a-card>
+
+            <a-card
+              v-if="showIntercityTransport"
+              id="intercity"
+              title="🚄 大交通"
+              :bordered="false"
+              class="intercity-card"
+            >
+              <div v-if="intercityRows.length" class="intercity-list">
+                <div
+                  v-for="row in intercityRows"
+                  :key="row.label"
+                  class="intercity-item"
+                >
+                  <div class="intercity-main">
+                    <span class="intercity-direction">{{ row.label }}</span>
+                    <span class="intercity-route">
+                      {{ row.option.departure_city }} -> {{ row.option.arrival_city }}
+                    </span>
+                  </div>
+                  <div class="intercity-meta">
+                    <span>{{ row.option.mode }}</span>
+                    <span v-if="row.option.code">{{ row.option.code }}</span>
+                    <span>{{ formatIntercityTime(row.option) }}</span>
+                    <span>{{ formatIntercityDuration(row.option.duration_minutes) }}</span>
+                    <span>¥{{ row.option.estimated_cost || 0 }}</span>
+                    <span>{{ formatIntercitySource(row.option) }}</span>
+                  </div>
+                  <div v-if="row.option.description" class="intercity-description">
+                    {{ row.option.description }}
+                  </div>
+                </div>
+              </div>
+              <div v-else class="intercity-empty">
+                未获取到实时票务，计划已继续生成。
+              </div>
+              <div
+                v-if="intercityTransport?.warnings?.length"
+                class="intercity-warning"
+              >
+                {{ intercityTransport.warnings[0] }}
               </div>
             </a-card>
 
@@ -97,8 +144,12 @@
                   <div class="budget-value">¥{{ tripPlan.budget.total_meals }}</div>
                 </div>
                 <div class="budget-item">
-                  <div class="budget-label">交通费用</div>
+                  <div class="budget-label">市内交通</div>
                   <div class="budget-value">¥{{ tripPlan.budget.total_transportation }}</div>
+                </div>
+                <div class="budget-item">
+                  <div class="budget-label">大交通</div>
+                  <div class="budget-value">¥{{ tripPlan.budget.total_intercity_transportation || 0 }}</div>
                 </div>
               </div>
               <div class="budget-total">
@@ -394,7 +445,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { computed, ref, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { DownOutlined } from '@ant-design/icons-vue'
@@ -402,7 +453,7 @@ import AMapLoader from '@amap/amap-jsapi-loader'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
 import { chatWithTripStream, getTripTask, type TripStreamEvent } from '@/services/api'
-import type { TripPlan } from '@/types'
+import type { IntercityTransportOption, TripPlan } from '@/types'
 
 const router = useRouter()
 const route = useRoute()
@@ -420,6 +471,33 @@ const chatLoading = ref(false)
 const chatStreamStatus = ref('')
 const chatHistory = ref<Array<{ role: 'user' | 'assistant'; content: string }>>([])
 let map: any = null
+let photoLoadVersion = 0
+const PHOTO_LOAD_CONCURRENCY = 4
+
+const tripTitle = computed(() => {
+  const plan = tripPlan.value
+  if (!plan) return '旅行计划'
+  return plan.departure_city
+    ? `${plan.departure_city} -> ${plan.city}旅行计划`
+    : `${plan.city}旅行计划`
+})
+
+const intercityTransport = computed(() => tripPlan.value?.intercity_transport)
+
+const showIntercityTransport = computed(() => {
+  const plan = intercityTransport.value
+  return !!plan && plan.status !== 'skipped'
+})
+
+const intercityRows = computed(() => {
+  const plan = intercityTransport.value
+  if (!plan) return []
+  const rows: Array<{ label: string; option?: IntercityTransportOption }> = [
+    { label: '去程', option: plan.selected_outbound },
+    { label: '返程', option: plan.selected_return }
+  ]
+  return rows.filter((item): item is { label: string; option: IntercityTransportOption } => !!item.option)
+})
 
 const handleChatStreamEvent = ({ event, data }: TripStreamEvent) => {
   if (event === 'heartbeat') {
@@ -469,9 +547,9 @@ onMounted(async () => {
   }
 
   if (tripPlan.value) {
-    await loadAttractionPhotos()
     await nextTick()
     initMap()
+    loadAttractionPhotosInBackground()
   }
 })
 
@@ -506,12 +584,12 @@ const sendChatMessage = async () => {
         sessionStorage.setItem('tripUserId', userId.value)
       }
 
-      await loadAttractionPhotos()
       if (map) {
         map.destroy()
       }
       await nextTick()
       initMap()
+      loadAttractionPhotosInBackground()
     } else {
       message.error(response.message || '修改失败')
     }
@@ -651,6 +729,27 @@ const formatDuration = (duration: number): string => {
   return `${Math.floor(mins / 60)}小时${mins % 60}分钟`
 }
 
+const formatIntercityDuration = (minutes?: number): string => {
+  if (!minutes) return '未知时长'
+  if (minutes < 60) return `${minutes}分钟`
+  return `${Math.floor(minutes / 60)}小时${minutes % 60}分钟`
+}
+
+const formatIntercityTime = (option: IntercityTransportOption): string => {
+  const depart = option.departure_time || '待确认'
+  const arrive = option.arrival_time || '待确认'
+  return `${option.date} ${depart} - ${arrive}`
+}
+
+const formatIntercitySource = (option: IntercityTransportOption): string => {
+  const map: Record<string, string> = {
+    tuniu_real_time: '途牛实时检索',
+    amap_route: '高德路线',
+    rule_based: '规则估算'
+  }
+  return map[option.data_source] || option.data_source || '估算'
+}
+
 const formatCostSource = (source: string): string => {
   const map: Record<string, string> = {
     route_fee: '路线费用',
@@ -682,30 +781,52 @@ const shouldShowHotelPriceSource = (source?: string): boolean => {
   return ['llm_estimate', 'default_estimate', 'estimate'].includes(source || '')
 }
 
-// 加载所有景点图片
-const loadAttractionPhotos = async () => {
-  if (!tripPlan.value) return
+// 后台渐进加载景点图片，页面先用占位图渲染，图片成功后自动替换。
+const loadAttractionPhotosInBackground = () => {
+  const plan = tripPlan.value
+  if (!plan) return
 
-  const promises: Promise<void>[] = []
+  const version = ++photoLoadVersion
+  attractionPhotos.value = {}
+  const names = Array.from(
+    new Set(
+      plan.days.flatMap(day =>
+        day.attractions
+          .map(attraction => attraction.name?.trim())
+          .filter((name): name is string => !!name)
+      )
+    )
+  )
 
-  tripPlan.value.days.forEach(day => {
-    day.attractions.forEach(attraction => {
-      const promise = fetch(`http://localhost:8000/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.success && data.data.photo_url) {
-            attractionPhotos.value[attraction.name] = data.data.photo_url
-          }
-        })
-        .catch(err => {
-          console.error(`获取${attraction.name}图片失败:`, err)
-        })
+  const loadOne = async (name: string) => {
+    try {
+      const res = await fetch(`http://localhost:8000/api/poi/photo?name=${encodeURIComponent(name)}`)
+      const data = await res.json()
+      if (version !== photoLoadVersion) return
+      if (data.success && data.data.photo_url) {
+        attractionPhotos.value = {
+          ...attractionPhotos.value,
+          [name]: data.data.photo_url
+        }
+      }
+    } catch (err) {
+      console.error(`获取${name}图片失败:`, err)
+    }
+  }
 
-      promises.push(promise)
+  const runQueue = async () => {
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(PHOTO_LOAD_CONCURRENCY, names.length) }, async () => {
+      while (cursor < names.length && version === photoLoadVersion) {
+        const name = names[cursor]
+        cursor += 1
+        await loadOne(name)
+      }
     })
-  })
+    await Promise.all(workers)
+  }
 
-  await Promise.all(promises)
+  void runQueue()
 }
 
 // 获取景点图片
@@ -1474,6 +1595,58 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
   font-size: 15px;
   color: #333;
   line-height: 1.6;
+}
+
+/* 大交通卡片 */
+.intercity-card {
+  height: fit-content;
+}
+
+.intercity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.intercity-item {
+  padding: 12px;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.intercity-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.intercity-direction {
+  color: #1890ff;
+}
+
+.intercity-route {
+  color: #333;
+}
+
+.intercity-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #555;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.intercity-description,
+.intercity-warning,
+.intercity-empty {
+  margin-top: 8px;
+  color: #8c6d1f;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 /* 预算卡片 */

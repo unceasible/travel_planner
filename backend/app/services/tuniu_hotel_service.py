@@ -42,12 +42,13 @@ class TuniuHotelService:
         start_date: str,
         end_date: str,
         keyword: str = "",
-        limit: int = 5,
+        limit: Optional[int] = None,
     ) -> str:
         if not self.settings.tuniu_api_key:
             raise RuntimeError("TUNIU_API_KEY is not configured")
         check_in, check_out = self._build_check_dates(start_date, end_date)
         search_keyword = self._build_keyword(accommodation, keyword)
+        effective_limit = max(1, int(limit or getattr(self.settings, "tuniu_hotel_limit", 20) or 20))
         args: Dict[str, Any] = {
             "cityName": city,
             "checkIn": check_in,
@@ -63,15 +64,18 @@ class TuniuHotelService:
                 "check_in": check_in,
                 "check_out": check_out,
                 "keyword": search_keyword,
+                "limit": effective_limit,
             },
         )
         with timed_event("tuniu.hotel_search", {"city": city}):
             payload = self._call_tool("tuniu_hotel_search", args)
-        hotels = self._extract_hotels(payload)[:limit]
+        hotels = self._extract_hotels(payload)[:effective_limit]
         log_event(
             "tuniu_hotel_search_result",
             {
                 "city": city,
+                "keyword": search_keyword,
+                "limit": effective_limit,
                 "count": len(hotels),
                 "has_prices": sum(1 for item in hotels if self._money(self._first_value(item, ("lowestPrice", "lowest_price", "price"))) > 0),
             },
@@ -318,19 +322,21 @@ class TuniuHotelService:
         return check_in.isoformat(), check_out.isoformat()
 
     def _build_keyword(self, accommodation: str, keyword: str = "") -> str:
+        explicit_keyword = str(keyword or "").strip()
+        if explicit_keyword:
+            return explicit_keyword
         accommodation_text = str(accommodation or "").strip()
-        parts = [str(keyword or "").strip(), accommodation_text]
+        if not accommodation_text:
+            return ""
+        if "民宿" in accommodation_text:
+            return "民宿"
+        if any(token in accommodation_text for token in ("豪华", "高端", "五星")):
+            return "豪华酒店"
+        if any(token in accommodation_text for token in ("舒适", "中档")):
+            return "舒适型酒店"
         if any(token in accommodation_text for token in ("经济", "便宜", "省钱")):
-            parts.extend(["经济型", "快捷酒店"])
-        elif any(token in accommodation_text for token in ("舒适", "中档")):
-            parts.extend(["舒适型", "商务酒店"])
-        elif any(token in accommodation_text for token in ("豪华", "高端", "五星")):
-            parts.extend(["豪华", "高星酒店"])
-        elif "民宿" in accommodation_text:
-            parts.append("民宿")
-        if any(token in accommodation_text for token in ("亲子", "带娃", "孩子")):
-            parts.append("亲子")
-        return " ".join(part for part in parts if part)
+            return "经济型酒店"
+        return accommodation_text
 
 
 _tuniu_hotel_service: TuniuHotelService | None = None

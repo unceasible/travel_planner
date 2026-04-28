@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 import json
 import re
+import time
+from threading import Lock
 from typing import List, Dict, Any, Optional
 import httpx
 from hello_agents.tools import MCPTool
@@ -52,6 +54,9 @@ def get_amap_mcp_tool() -> MCPTool:
 
 
 class AmapService:
+    _route_http_lock = Lock()
+    _route_last_request_at = 0.0
+
     """高德地图服务封装类"""
     
     def __init__(self):
@@ -160,6 +165,13 @@ class AmapService:
             if direct_result:
                 return direct_result
 
+            if not bool(getattr(self.settings, "amap_route_mcp_fallback_enabled", False)):
+                log_event(
+                    "transport_route_mcp_fallback_skipped",
+                    {"route_type": route_type, "origin": origin_address, "destination": destination_address},
+                )
+                return {}
+
             # 根据路线类型选择工具
             tool_map = {
                 "walking": "maps_direction_walking_by_address",
@@ -238,7 +250,7 @@ class AmapService:
                 "extensions": "all",
             }
         try:
-            response = self.http_client.get(url, params=params)
+            response = self._route_http_get(url, params)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
@@ -274,6 +286,57 @@ class AmapService:
                 },
             )
         return parsed
+
+    def _route_http_get(self, url: str, params: Dict[str, Any]) -> httpx.Response:
+        max_retries = max(0, int(getattr(self.settings, "amap_route_max_retries", 2) or 0))
+        response: Optional[httpx.Response] = None
+        for attempt in range(max_retries + 1):
+            response = self._route_http_get_once(url, params)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except Exception:
+                return response
+            if not self._is_route_qps_limit(data) or attempt >= max_retries:
+                return response
+            log_event(
+                "transport_route_http_rate_limited",
+                {
+                    "route_type": self._route_type_from_url(url),
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "info": data.get("info") or "",
+                    "infocode": data.get("infocode") or "",
+                },
+            )
+            time.sleep(self._route_backoff_seconds(attempt))
+        return response
+
+    def _route_http_get_once(self, url: str, params: Dict[str, Any]) -> httpx.Response:
+        with AmapService._route_http_lock:
+            interval = max(0.0, float(getattr(self.settings, "amap_route_min_interval_seconds", 0.35) or 0.0))
+            elapsed = time.monotonic() - AmapService._route_last_request_at
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+            try:
+                return self.http_client.get(url, params=params)
+            finally:
+                AmapService._route_last_request_at = time.monotonic()
+
+    def _is_route_qps_limit(self, data: Dict[str, Any]) -> bool:
+        text = f"{data.get('info') or ''} {data.get('infocode') or ''}".upper()
+        return "CUQPS_HAS_EXCEEDED_THE_LIMIT" in text
+
+    def _route_backoff_seconds(self, attempt: int) -> float:
+        base = max(0.0, float(getattr(self.settings, "amap_route_rate_limit_backoff_seconds", 1.2) or 0.0))
+        return base * (attempt + 1)
+
+    def _route_type_from_url(self, url: str) -> str:
+        if "driving" in url:
+            return "driving"
+        if "transit" in url:
+            return "transit"
+        return "walking"
 
     def _format_lng_lat(self, location: Dict[str, float]) -> str:
         try:

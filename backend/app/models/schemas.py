@@ -9,10 +9,12 @@ from pydantic import BaseModel, Field, field_validator
 class TripRequest(BaseModel):
     """旅行规划请求"""
     nickname: str = Field(..., description="用户昵称,用于生成长期用户记忆", example="Alice")
+    departure_city: str = Field(default="", description="出发城市", example="天津")
     city: str = Field(..., description="目的地城市", example="北京")
     start_date: str = Field(..., description="开始日期 YYYY-MM-DD", example="2025-06-01")
     end_date: str = Field(..., description="结束日期 YYYY-MM-DD", example="2025-06-03")
     travel_days: int = Field(..., description="旅行天数", ge=1, le=30, example=3)
+    intercity_transportation: str = Field(default="智能推荐", description="大交通偏好: 智能推荐/飞机/火车/自驾", example="智能推荐")
     transportation: str = Field(..., description="交通方式", example="公共交通")
     accommodation: str = Field(..., description="住宿偏好", example="经济型酒店")
     preferences: List[str] = Field(default=[], description="旅行偏好标签", example=["历史文化", "美食"])
@@ -22,10 +24,12 @@ class TripRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "nickname": "Alice",
+                "departure_city": "天津",
                 "city": "北京",
                 "start_date": "2025-06-01",
                 "end_date": "2025-06-03",
                 "travel_days": 3,
+                "intercity_transportation": "智能推荐",
                 "transportation": "公共交通",
                 "accommodation": "经济型酒店",
                 "preferences": ["历史文化", "美食"],
@@ -114,6 +118,37 @@ class TransportSegment(BaseModel):
     description: str = Field(default="", description="路线说明")
 
 
+class IntercityTransportOption(BaseModel):
+    """城市间大交通候选."""
+
+    direction: str = Field(default="", description="方向: outbound/return")
+    mode: str = Field(default="", description="交通方式: 飞机/火车/自驾")
+    provider: str = Field(default="", description="数据提供方")
+    departure_city: str = Field(default="", description="出发城市")
+    arrival_city: str = Field(default="", description="到达城市")
+    date: str = Field(default="", description="出行日期 YYYY-MM-DD")
+    departure_time: str = Field(default="", description="出发时间")
+    arrival_time: str = Field(default="", description="到达时间")
+    duration_minutes: int = Field(default=0, description="耗时(分钟)")
+    estimated_cost: int = Field(default=0, description="预估费用(元)")
+    code: str = Field(default="", description="航班号/车次")
+    data_source: str = Field(default="", description="价格/路线数据来源")
+    description: str = Field(default="", description="补充说明")
+
+
+class IntercityTransportPlan(BaseModel):
+    """城市间大交通计划."""
+
+    status: str = Field(default="skipped", description="状态: skipped/ok/partial/unavailable")
+    preference: str = Field(default="智能推荐", description="大交通偏好")
+    outbound_candidates: List[IntercityTransportOption] = Field(default_factory=list)
+    return_candidates: List[IntercityTransportOption] = Field(default_factory=list)
+    selected_outbound: Optional[IntercityTransportOption] = None
+    selected_return: Optional[IntercityTransportOption] = None
+    schedule_constraints: dict = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
+
+
 class DayBudget(BaseModel):
     """单日预算信息"""
     attractions: int = Field(default=0, description="当日景点门票费用")
@@ -167,11 +202,13 @@ class Budget(BaseModel):
     total_hotels: int = Field(default=0, description="酒店总费用")
     total_meals: int = Field(default=0, description="餐饮总费用")
     total_transportation: int = Field(default=0, description="交通总费用")
+    total_intercity_transportation: int = Field(default=0, description="大交通总费用")
     total: int = Field(default=0, description="总费用")
 
 
 class TripPlan(BaseModel):
     """旅行计划"""
+    departure_city: str = Field(default="", description="出发城市")
     city: str = Field(..., description="目的地城市")
     start_date: str = Field(..., description="开始日期")
     end_date: str = Field(..., description="结束日期")
@@ -179,6 +216,7 @@ class TripPlan(BaseModel):
     weather_info: List[WeatherInfo] = Field(default=[], description="天气信息")
     overall_suggestions: str = Field(..., description="总体建议")
     budget: Optional[Budget] = Field(default=None, description="预算信息")
+    intercity_transport: Optional[IntercityTransportPlan] = Field(default=None, description="城市间大交通计划")
 
 
 class TripPlanResponse(BaseModel):

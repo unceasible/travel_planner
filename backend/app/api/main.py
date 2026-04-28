@@ -4,8 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..agents.trip_planner_agent import close_trip_planner_agent, get_trip_planner_agent
 from ..config import get_settings, validate_config, print_config
-from ..services.agent_output_logger import shutdown_agent_output_logger
+from ..services.agent_output_logger import shutdown_agent_output_logger, start_agent_output_logger
 from ..services.intent_classifier import get_intent_classifier
+from ..services.memory_store import shutdown_memory_store
 from .routes import trip, poi, map as map_routes
 
 # 获取配置
@@ -38,6 +39,7 @@ app.include_router(map_routes.router, prefix="/api")
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件"""
+    start_agent_output_logger()
     get_trip_planner_agent()
     print("\n" + "="*60)
     print(f"🚀 {settings.app_name} v{settings.app_version}")
@@ -67,6 +69,7 @@ async def startup_event():
 async def shutdown_event():
     """应用关闭事件"""
     close_trip_planner_agent()
+    shutdown_memory_store()
     shutdown_agent_output_logger()
     print("\n" + "="*60)
     print("👋 应用正在关闭...")

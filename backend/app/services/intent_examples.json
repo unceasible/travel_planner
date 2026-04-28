@@ -56,6 +56,34 @@
     "action": "replace"
   },
   {
+    "text": "从上海出发",
+    "primary_intent": "replan",
+    "intents": ["replan"],
+    "domains": ["intercity_transport"],
+    "action": "replace"
+  },
+  {
+    "text": "帮我查机票",
+    "primary_intent": "replan",
+    "intents": ["replan"],
+    "domains": ["intercity_transport"],
+    "action": "replace"
+  },
+  {
+    "text": "改成坐火车",
+    "primary_intent": "replan",
+    "intents": ["replan"],
+    "domains": ["intercity_transport"],
+    "action": "replace"
+  },
+  {
+    "text": "这次自驾过去",
+    "primary_intent": "replan",
+    "intents": ["replan"],
+    "domains": ["intercity_transport"],
+    "action": "replace"
+  },
+  {
     "text": "换成北京重新规划",
     "primary_intent": "replan",
     "intents": ["replan"],

@@ -9,11 +9,15 @@ from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, Callable, Dict, List, Tuple
 
+from ..agents.reflection_agent import ReflectionAgent, ReflectionReview, review_error_entry
 from ..agents.trip_planner_agent import get_trip_planner_agent
 from ..agents.user_profile_agent import UserProfileAgent
+from ..config import get_settings
 from ..models.schemas import (
     Budget,
     DayBudget,
+    DayPlan,
+    Hotel,
     Meal,
     TransportSegment,
     TripChatRequest,
@@ -25,6 +29,7 @@ from ..models.schemas import (
 from .agent_output_logger import log_event, timed_event
 from .amap_service import get_amap_service
 from .conversation_context import ConversationContextCompressor
+from .intercity_transport_agent import get_intercity_transport_agent
 from .intent_classifier import NON_PERSIST_INTENTS, get_intent_classifier
 from .llm_service import get_cheap_openai_client, get_cheap_openai_model
 from .memory_store import get_memory_store, now_iso
@@ -50,10 +55,26 @@ PATCH_DOMAIN_KEYWORDS = {
     "hotels": [r"酒店", r"住宿", r"民宿"],
     "weather": [r"下雨", r"天气", r"温度", r"风"],
     "attractions": [r"景点", r"博物馆", r"公园", r"展览", r"路线"],
+    "intercity_transport": [
+        r"出发城市",
+        r"从.+出发",
+        r"机票",
+        r"航班",
+        r"火车",
+        r"高铁",
+        r"动车",
+        r"自驾过去",
+        r"自驾往返",
+        r"开车过去",
+        r"开车去",
+        r"大交通",
+    ],
 }
 
 MEAL_DEFAULTS = {"breakfast": 25, "lunch": 60, "dinner": 90, "snack": 30}
+REFLECTION_REPLAN_THRESHOLD = 7
 HOTEL_DEFAULTS = {"经济型酒店": 300, "舒适型酒店": 500, "豪华酒店": 900, "民宿": 450}
+SELF_DRIVE_SUGGESTION_TOKENS = ("自驾", "开车", "驾车", "租车", "drive", "driving", "self-drive", "car rental")
 
 
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
@@ -64,9 +85,13 @@ class TripTaskExecutor:
         self.memory_store = get_memory_store()
         self.planner = get_trip_planner_agent()
         self.user_profile_agent = UserProfileAgent(self.memory_store)
-        self.retrieval_executor = ThreadPoolExecutor(max_workers=4)
+        self.reflection_agent = ReflectionAgent()
+        self.intercity_agent = get_intercity_transport_agent()
+        self.settings = get_settings()
+        route_workers = max(1, int(getattr(self.settings, "amap_route_max_workers", 1) or 1))
+        self.retrieval_executor = ThreadPoolExecutor(max_workers=5)
         self.transport_executor = ThreadPoolExecutor(max_workers=8)
-        self.route_executor = ThreadPoolExecutor(max_workers=4)
+        self.route_executor = ThreadPoolExecutor(max_workers=route_workers)
         self.profile_executor = ThreadPoolExecutor(max_workers=1)
         self.context_executor = ThreadPoolExecutor(max_workers=1)
         self.intent_classifier = get_intent_classifier()
@@ -114,7 +139,7 @@ class TripTaskExecutor:
             )
         )
 
-        self._emit_progress(progress, "retrieval_started", "正在检索景点、酒店、餐饮和天气", 15, task_id=task_record["task_id"])
+        self._emit_progress(progress, "retrieval_started", "正在检索景点、酒店、餐饮、天气和大交通", 15, task_id=task_record["task_id"])
         retrieval_results = self._fetch_initial_context_parallel(request)
         self._emit_progress(progress, "retrieval_completed", "检索完成，正在整理候选信息", 35, task_id=task_record["task_id"])
         print("=" * 80, flush=True)
@@ -132,6 +157,7 @@ class TripTaskExecutor:
                 restaurants=retrieval_results["restaurants"],
                 user_profile_summary=user_profile_summary,
                 extra_requirements=request.free_text_input or "",
+                intercity_transport=retrieval_results.get("intercity_transport"),
             )
         self._emit_progress(progress, "llm_completed", "初步计划已生成，正在补充交通和预算", 75, task_id=task_record["task_id"])
         print("INFO plan_initial build_plan_from_context end", flush=True)
@@ -144,18 +170,36 @@ class TripTaskExecutor:
         with timed_event("plan_initial.aggregate_budget", {"days": len(plan.days)}):
             plan = self._aggregate_budget(plan, request.accommodation)
         print("INFO plan_initial aggregate_budget end", flush=True)
-        print("INFO plan_initial reflect_and_fix start", flush=True)
+        print("INFO plan_initial quality_gate start", flush=True)
         self._emit_progress(progress, "reflection_started", "正在做最终检查", 92, task_id=task_record["task_id"])
-        log_event("plan_before_reflect_and_fix", plan.model_dump_json(indent=2))
-        with timed_event("plan_initial.reflect_and_fix", {"days": len(plan.days)}):
-            plan, reflection = self._reflect_and_fix(plan, request.model_dump())
-        log_event("plan_after_reflect_and_fix", plan.model_dump_json(indent=2))
-        print("INFO plan_initial reflect_and_fix end", flush=True)
+        log_event("plan_before_quality_gate", plan.model_dump_json(indent=2))
+        with timed_event("plan_initial.quality_gate", {"days": len(plan.days)}):
+            plan, reflection_log = self._run_quality_gate(
+                plan,
+                request.model_dump(),
+                user_profile_summary=user_profile_summary,
+                conversation_history=[],
+                user_message=request.free_text_input or "",
+                update_mode="initial",
+                retry_once=lambda feedback: self.planner.build_plan_from_context(
+                    request=request,
+                    attractions=retrieval_results["attractions"],
+                    weather=retrieval_results["weather"],
+                    hotels=retrieval_results["hotels"],
+                    restaurants=retrieval_results["restaurants"],
+                    user_profile_summary=user_profile_summary,
+                    extra_requirements=request.free_text_input or "",
+                    intercity_transport=retrieval_results.get("intercity_transport"),
+                    reflection_feedback=feedback,
+                ),
+            )
+        log_event("plan_after_quality_gate", plan.model_dump_json(indent=2))
+        print("INFO plan_initial quality_gate end", flush=True)
 
         assistant_message = "已生成初步计划，你可以继续直接提意见让我修改。"
         task_record["current_plan"] = plan.model_dump()
         task_record["budget_ledger"] = self._build_budget_ledger(plan)
-        task_record["reflection_log"] = [reflection]
+        task_record["reflection_log"] = reflection_log
         task_record["conversation_log"] = [
             {
                 "role": "assistant",
@@ -166,7 +210,7 @@ class TripTaskExecutor:
         ]
         task_record["update_mode"] = "initial"
         with timed_event("plan_initial.write_task", {"task_id": task_record["task_id"]}):
-            self.memory_store.write_task(task_record)
+            self._write_task_async_or_sync(task_record)
         self._emit_progress(progress, "persisted", "计划已保存", 98, task_id=task_record["task_id"])
 
         return TripPlanResponse(
@@ -323,6 +367,7 @@ class TripTaskExecutor:
             )
 
         update_mode = "replan" if intent_result.primary_intent == "replan" else "patch"
+        patch_context: Dict[str, Any] = {}
         if update_mode == "patch":
             intent_domains = {domain for domain in intent_result.domains if domain != "none"}
             selected_domains = self._domains_to_retrieval_domains(intent_result.domains)
@@ -389,10 +434,41 @@ class TripTaskExecutor:
         plan = self._add_transport_segments_parallel(plan, form_snapshot.get("transportation", "公共交通"))
         self._emit_progress(progress, "budget_started", "正在重新汇总预算", 88, task_id=request.task_id)
         plan = self._aggregate_budget(plan, form_snapshot.get("accommodation", "舒适型酒店"))
-        log_event("plan_before_reflect_and_fix", plan.model_dump_json(indent=2))
+        def retry_after_reflection(feedback: str) -> TripPlan:
+            nonlocal form_snapshot
+            if update_mode == "patch":
+                return self.planner.revise_plan(
+                    current_plan=current_plan,
+                    form_snapshot=form_snapshot,
+                    user_message=request.user_message,
+                    patch_context=patch_context,
+                    user_profile_summary=user_profile_summary,
+                    conversation_history=conversation_history,
+                    reflection_feedback=feedback,
+                )
+            retry_plan, retry_form = self._replan_from_message(
+                form_snapshot,
+                request.user_message,
+                user_profile_summary,
+                conversation_history,
+                reflection_feedback=feedback,
+            )
+            form_snapshot = retry_form
+            return retry_plan
+
+        log_event("plan_before_quality_gate", plan.model_dump_json(indent=2))
         self._emit_progress(progress, "reflection_started", "正在做最终检查", 92, task_id=request.task_id)
-        plan, reflection = self._reflect_and_fix(plan, form_snapshot)
-        log_event("plan_after_reflect_and_fix", plan.model_dump_json(indent=2))
+        with timed_event("chat.quality_gate", {"task_id": request.task_id, "update_mode": update_mode}):
+            plan, reflection_log = self._run_quality_gate(
+                plan,
+                form_snapshot,
+                user_profile_summary=user_profile_summary,
+                conversation_history=conversation_history,
+                user_message=request.user_message,
+                update_mode=update_mode,
+                retry_once=retry_after_reflection,
+            )
+        log_event("plan_after_quality_gate", plan.model_dump_json(indent=2))
 
         assistant_message = self._build_revision_message(update_mode)
         if "refuse" in intent_result.intents and intent_result.primary_intent != "refuse":
@@ -404,7 +480,7 @@ class TripTaskExecutor:
             request.user_message,
             assistant_message,
             update_mode,
-            reflection,
+            reflection_log,
         )
         self._start_context_compression_if_needed(task_record)
         self._emit_progress(progress, "persisted", "修改已保存", 96, task_id=request.task_id)
@@ -456,10 +532,19 @@ class TripTaskExecutor:
         self.memory_store.write_task(record)
         return record, user_memory
 
-    def _fetch_initial_context_parallel(self, request: TripRequest) -> Dict[str, str]:
+    def _fetch_initial_context_parallel(self, request: TripRequest) -> Dict[str, Any]:
         with timed_event("retrieval.initial.total", {"city": request.city, "travel_days": request.travel_days}):
             futures = {
                 "attractions": self.retrieval_executor.submit(self.planner.search_initial_attractions, request),
+                "intercity_transport": self.retrieval_executor.submit(
+                    self.intercity_agent.search,
+                    departure_city=request.departure_city,
+                    destination_city=request.city,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    preference=request.intercity_transportation,
+                    allow_self_drive=self._allows_self_drive_suggestions(request.model_dump()),
+                ),
                 "hotels": self.retrieval_executor.submit(
                     self.planner.search_hotels,
                     request.city,
@@ -485,7 +570,7 @@ class TripTaskExecutor:
         message: str,
         form_snapshot: Dict[str, Any],
         selected_domains: set[str] | None = None,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         with timed_event("retrieval.patch.total", {"domains": sorted(selected_domains or [])}):
             request = self._dict_to_request(form_snapshot)
             if selected_domains is None:
@@ -520,28 +605,40 @@ class TripTaskExecutor:
                     request.start_date,
                     request.end_date,
                 )
+            if "intercity_transport" in selected_domains:
+                futures["intercity_transport"] = self.retrieval_executor.submit(
+                    self.intercity_agent.search,
+                    departure_city=request.departure_city,
+                    destination_city=request.city,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    preference=request.intercity_transportation,
+                    allow_self_drive=self._allows_self_drive_suggestions(request.model_dump()),
+                )
             return self._wait_future_map(futures)
 
     def _select_patch_domains(self, message: str) -> set[str]:
         return {domain for domain, patterns in PATCH_DOMAIN_KEYWORDS.items() if any(re.search(p, message) for p in patterns)}
 
     def _domains_to_retrieval_domains(self, domains: List[str]) -> set[str]:
-        retrievable = {"attractions", "hotels", "restaurants", "weather"}
+        retrievable = {"attractions", "hotels", "restaurants", "weather", "intercity_transport"}
         return {domain for domain in domains if domain in retrievable}
 
     def _build_trip_context(self, form_snapshot: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "city": form_snapshot.get("city", ""),
+            "departure_city": form_snapshot.get("departure_city", ""),
             "start_date": form_snapshot.get("start_date", ""),
             "end_date": form_snapshot.get("end_date", ""),
             "travel_days": form_snapshot.get("travel_days", 0),
+            "intercity_transportation": form_snapshot.get("intercity_transportation", ""),
             "transportation": form_snapshot.get("transportation", ""),
             "accommodation": form_snapshot.get("accommodation", ""),
             "preferences": form_snapshot.get("preferences", []) or [],
         }
 
-    def _wait_future_map(self, futures: Dict[str, Any]) -> Dict[str, str]:
-        results: Dict[str, str] = {}
+    def _wait_future_map(self, futures: Dict[str, Any]) -> Dict[str, Any]:
+        results: Dict[str, Any] = {}
         for key, future in futures.items():
             try:
                 with timed_event("future.wait", {"key": key}):
@@ -565,6 +662,7 @@ class TripTaskExecutor:
         user_message: str,
         user_profile_summary: str,
         conversation_history: List[Dict[str, Any]] | None = None,
+        reflection_feedback: str = "",
     ) -> Tuple[TripPlan, Dict[str, Any]]:
         merged_form = self._merge_message_into_form(form_snapshot, user_message)
         request = self._dict_to_request(merged_form)
@@ -579,6 +677,8 @@ class TripTaskExecutor:
                 user_profile_summary=user_profile_summary,
                 extra_requirements=request.free_text_input or "",
                 conversation_history=conversation_history or [],
+                intercity_transport=retrieval_results.get("intercity_transport"),
+                reflection_feedback=reflection_feedback,
             )
         return plan, merged_form
 
@@ -586,7 +686,22 @@ class TripTaskExecutor:
         merged = deepcopy(form_snapshot)
         prev = str(merged.get("free_text_input", "")).strip()
         merged["free_text_input"] = f"{prev}\n{user_message}".strip()
-        if re.search(r"改成自驾", user_message):
+        intercity_transport_changed = False
+        departure_match = re.search(r"从([一-龥A-Za-z]{2,24})出发", user_message)
+        if departure_match:
+            merged["departure_city"] = departure_match.group(1).strip()
+            intercity_transport_changed = True
+        if re.search(r"(机票|航班|飞机)", user_message):
+            merged["intercity_transportation"] = "飞机"
+            intercity_transport_changed = True
+        elif re.search(r"(火车|高铁|动车|列车)", user_message):
+            merged["intercity_transportation"] = "火车"
+            intercity_transport_changed = True
+        elif re.search(r"(自驾过去|自驾往返|开车过去|开车去|大交通.*自驾)", user_message):
+            merged["intercity_transportation"] = "自驾"
+            intercity_transport_changed = True
+        explicit_local_transport = re.search(r"(市内|当地|目的地内|城内|每日|每天|景点间|交通方式|市内交通|目的地内交通|当地交通)", user_message)
+        if re.search(r"改成自驾", user_message) and (not intercity_transport_changed or explicit_local_transport):
             merged["transportation"] = "自驾"
         elif re.search(r"改成公共交通", user_message):
             merged["transportation"] = "公共交通"
@@ -609,8 +724,10 @@ class TripTaskExecutor:
         jobs = []
         route_cache: Dict[str, Dict[str, Any]] = {}
         route_cache_lock = Lock()
-        for day in plan.days:
-            for from_point, to_point in self._build_day_pairs(day):
+        last_day_index = max(len(plan.days) - 1, 0)
+        for idx, day in enumerate(plan.days):
+            is_last_day = idx == last_day_index
+            for from_point, to_point in self._build_day_pairs(day, is_last_day=is_last_day):
                 jobs.append((day.day_index, from_point, to_point, transportation, plan.city, route_cache, route_cache_lock))
 
         with timed_event("transport_segments.submit", {"jobs": len(jobs), "days": len(plan.days)}):
@@ -629,7 +746,7 @@ class TripTaskExecutor:
         self._log_transport_route_diagnostics(plan)
         return plan
 
-    def _build_day_pairs(self, day) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    def _build_day_pairs(self, day, is_last_day: bool = False) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
         attractions = list(day.attractions or [])
         if not attractions:
             return []
@@ -644,7 +761,7 @@ class TripTaskExecutor:
             pairs.append((hotel_point, points[0]))
         for idx in range(len(points) - 1):
             pairs.append((points[idx], points[idx + 1]))
-        if hotel_point:
+        if hotel_point and not is_last_day:
             pairs.append((points[-1], hotel_point))
         return pairs
 
@@ -903,7 +1020,9 @@ class TripTaskExecutor:
 
     def _aggregate_budget(self, plan: TripPlan, accommodation: str) -> TripPlan:
         total_attractions = total_hotels = total_meals = total_transportation = 0
-        for day in plan.days:
+        total_intercity_transportation = self._intercity_transportation_cost(plan)
+        last_day_index = max(len(plan.days) - 1, 0)
+        for idx, day in enumerate(plan.days):
             for meal in day.meals:
                 if meal.estimated_cost <= 0:
                     print(
@@ -923,7 +1042,7 @@ class TripTaskExecutor:
 
             attractions_cost = sum(max(item.ticket_price, 0) for item in day.attractions)
             meals_cost = sum(max(item.estimated_cost, 0) for item in day.meals)
-            hotel_cost = day.hotel.estimated_cost if day.hotel else 0
+            hotel_cost = day.hotel.estimated_cost if day.hotel and idx < last_day_index else 0
             transportation_cost = sum(max(item.estimated_cost, 0) for item in day.transport_segments)
             day.day_budget = DayBudget(
                 attractions=attractions_cost,
@@ -942,9 +1061,20 @@ class TripTaskExecutor:
             total_hotels=total_hotels,
             total_meals=total_meals,
             total_transportation=total_transportation,
-            total=total_attractions + total_hotels + total_meals + total_transportation,
+            total_intercity_transportation=total_intercity_transportation,
+            total=total_attractions + total_hotels + total_meals + total_transportation + total_intercity_transportation,
         )
         return plan
+
+    def _intercity_transportation_cost(self, plan: TripPlan) -> int:
+        intercity = getattr(plan, "intercity_transport", None)
+        if not intercity:
+            return 0
+        total = 0
+        for option in (intercity.selected_outbound, intercity.selected_return):
+            if option:
+                total += max(int(option.estimated_cost or 0), 0)
+        return total
 
     def _build_meal_from_existing_candidates(self, plan: TripPlan, meal_type: str) -> Meal | None:
         for day in plan.days:
@@ -986,6 +1116,325 @@ class TripTaskExecutor:
             estimated_cost=MEAL_DEFAULTS.get(meal_type, 30),
         )
 
+    def _run_quality_gate(
+        self,
+        plan: TripPlan,
+        form_snapshot: Dict[str, Any],
+        user_profile_summary: str,
+        conversation_history: List[Dict[str, Any]],
+        user_message: str,
+        update_mode: str,
+        retry_once: Callable[[str], TripPlan] | None,
+    ) -> Tuple[TripPlan, List[Dict[str, Any]]]:
+        reflection_log: List[Dict[str, Any]] = []
+
+        plan, format_entry = self._reflect_and_fix(plan, form_snapshot)
+        format_entry["retry_used"] = False
+        reflection_log.append(format_entry)
+        plan, transport_guard_entry = self._enforce_transport_preference_constraints(plan, form_snapshot)
+        if transport_guard_entry:
+            reflection_log.append(transport_guard_entry)
+
+        quality_entry = self._review_plan_quality(
+            plan,
+            form_snapshot,
+            user_profile_summary,
+            conversation_history,
+            user_message,
+            update_mode,
+            retry_used=False,
+        )
+        reflection_log.append(quality_entry)
+
+        if retry_once is None or not self._needs_reflection_retry(quality_entry):
+            return plan, reflection_log
+
+        feedback = self._format_reflection_feedback(quality_entry)
+        log_event(
+            "reflection_retry_started",
+            {"score": quality_entry.get("score"), "status": quality_entry.get("status"), "update_mode": update_mode},
+        )
+        retry_plan = retry_once(feedback)
+        retry_plan = self._add_transport_segments_parallel(
+            retry_plan,
+            form_snapshot.get("transportation", "å…¬å…±äº¤é€š"),
+        )
+        retry_plan = self._aggregate_budget(retry_plan, form_snapshot.get("accommodation", "èˆ’é€‚åž‹é…’åº—"))
+        retry_plan, retry_format_entry = self._reflect_and_fix(retry_plan, form_snapshot)
+        retry_format_entry["retry_used"] = True
+        reflection_log.append(retry_format_entry)
+        retry_plan, retry_transport_guard_entry = self._enforce_transport_preference_constraints(retry_plan, form_snapshot)
+        if retry_transport_guard_entry:
+            reflection_log.append(retry_transport_guard_entry)
+
+        retry_quality_entry = self._review_plan_quality(
+            retry_plan,
+            form_snapshot,
+            user_profile_summary,
+            conversation_history,
+            user_message,
+            update_mode,
+            retry_used=True,
+        )
+        reflection_log.append(retry_quality_entry)
+        if self._quality_entry_has_critical_hotel_issue(retry_quality_entry):
+            retry_plan, hotel_cleanup_entry = self._remove_unsafe_hotels_by_distance(retry_plan, form_snapshot)
+            if hotel_cleanup_entry:
+                reflection_log.append(hotel_cleanup_entry)
+        retry_plan, final_transport_guard_entry = self._enforce_transport_preference_constraints(retry_plan, form_snapshot)
+        if final_transport_guard_entry:
+            reflection_log.append(final_transport_guard_entry)
+        return retry_plan, reflection_log
+
+    def _allows_self_drive_suggestions(self, form_snapshot: Dict[str, Any]) -> bool:
+        return (
+            str(form_snapshot.get("transportation") or "").strip() == "自驾"
+            or str(form_snapshot.get("intercity_transportation") or "").strip() == "自驾"
+        )
+
+    def _enforce_transport_preference_constraints(
+        self,
+        plan: TripPlan,
+        form_snapshot: Dict[str, Any],
+    ) -> Tuple[TripPlan, Dict[str, Any] | None]:
+        if self._allows_self_drive_suggestions(form_snapshot):
+            return plan, None
+
+        changes: List[Dict[str, Any]] = []
+        cleaned = self._remove_self_drive_sentences(plan.overall_suggestions)
+        if cleaned != plan.overall_suggestions:
+            changes.append({"field": "overall_suggestions", "before": plan.overall_suggestions, "after": cleaned})
+            plan.overall_suggestions = cleaned
+
+        for day in plan.days:
+            cleaned_description = self._remove_self_drive_sentences(day.description)
+            if cleaned_description != day.description:
+                changes.append(
+                    {
+                        "field": "day.description",
+                        "day_index": day.day_index,
+                        "before": day.description,
+                        "after": cleaned_description,
+                    }
+                )
+                day.description = cleaned_description
+
+        transport_plan = plan.intercity_transport
+        if transport_plan:
+            outbound_count = len(transport_plan.outbound_candidates)
+            return_count = len(transport_plan.return_candidates)
+            transport_plan.outbound_candidates = [
+                option for option in transport_plan.outbound_candidates if option.mode != "自驾"
+            ]
+            transport_plan.return_candidates = [
+                option for option in transport_plan.return_candidates if option.mode != "自驾"
+            ]
+            if transport_plan.selected_outbound and transport_plan.selected_outbound.mode == "自驾":
+                transport_plan.selected_outbound = None
+            if transport_plan.selected_return and transport_plan.selected_return.mode == "自驾":
+                transport_plan.selected_return = None
+            transport_plan.warnings = [
+                self._remove_self_drive_sentences(warning).replace("或自驾路线", "").strip(" ，。;；")
+                for warning in (transport_plan.warnings or [])
+            ]
+            transport_plan.warnings = [warning for warning in transport_plan.warnings if warning]
+            removed = (
+                outbound_count
+                + return_count
+                - len(transport_plan.outbound_candidates)
+                - len(transport_plan.return_candidates)
+            )
+            if removed:
+                changes.append({"field": "intercity_transport", "removed_self_drive_candidates": removed})
+
+        if not changes:
+            return plan, None
+        return plan, {
+            "phase": "transport_preference_guard",
+            "timestamp": now_iso(),
+            "allow_self_drive": False,
+            "changes": changes,
+        }
+
+    def _remove_self_drive_sentences(self, text: str) -> str:
+        value = str(text or "")
+        if not value:
+            return value
+        pieces = re.findall(r"[^。！？.!?]+[。！？.!?]?", value)
+        if not pieces:
+            pieces = [value]
+        filtered = [
+            piece
+            for piece in pieces
+            if not any(token.lower() in piece.lower() for token in SELF_DRIVE_SUGGESTION_TOKENS)
+        ]
+        result = "".join(filtered).strip()
+        if result:
+            return result
+        return "已按你选择的交通方式安排行程，请以实时交通信息为准。"
+
+    def _review_plan_quality(
+        self,
+        plan: TripPlan,
+        form_snapshot: Dict[str, Any],
+        user_profile_summary: str,
+        conversation_history: List[Dict[str, Any]],
+        user_message: str,
+        update_mode: str,
+        retry_used: bool,
+    ) -> Dict[str, Any]:
+        try:
+            review = self.reflection_agent.review_plan(
+                plan=plan,
+                form_snapshot=form_snapshot,
+                user_profile_summary=user_profile_summary,
+                conversation_history=conversation_history,
+                user_message=user_message,
+                update_mode=update_mode,
+            )
+            if not isinstance(review, ReflectionReview):
+                review = ReflectionReview.model_validate(review)
+            entry = review.model_dump()
+            entry.update({
+                "phase": "quality_review",
+                "timestamp": now_iso(),
+                "retry_used": retry_used,
+            })
+        except Exception as exc:
+            entry = review_error_entry(exc, retry_used)
+        log_event("reflection_quality_review", entry)
+        return entry
+
+    def _needs_reflection_retry(self, quality_entry: Dict[str, Any]) -> bool:
+        if quality_entry.get("status") == "review_error":
+            return False
+        try:
+            score = int(quality_entry.get("score"))
+        except Exception:
+            return False
+        return quality_entry.get("status") == "needs_replan" and score < REFLECTION_REPLAN_THRESHOLD
+
+    def _format_reflection_feedback(self, quality_entry: Dict[str, Any]) -> str:
+        payload = {
+            "score": quality_entry.get("score"),
+            "status": quality_entry.get("status"),
+            "issues": quality_entry.get("issues", []),
+            "improvement_instructions": quality_entry.get("improvement_instructions", ""),
+            "summary": quality_entry.get("summary", ""),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _quality_entry_has_critical_hotel_issue(self, quality_entry: Dict[str, Any]) -> bool:
+        for issue in quality_entry.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            severity = str(issue.get("severity") or "").lower()
+            text = " ".join(str(issue.get(key) or "") for key in ("type", "message", "summary")).lower()
+            if severity == "critical" and any(
+                token in text
+                for token in (
+                    "hotel",
+                    "accommodation",
+                    "lodging",
+                    "placeholder",
+                    "酒店",
+                    "住宿",
+                    "选址",
+                    "通勤",
+                )
+            ):
+                return True
+        return False
+
+    def _remove_unsafe_hotels_by_distance(
+        self,
+        plan: TripPlan,
+        form_snapshot: Dict[str, Any],
+    ) -> Tuple[TripPlan, Dict[str, Any] | None]:
+        threshold = float(getattr(getattr(self, "settings", None), "hotel_hard_distance_to_main_cluster_m", 15000) or 15000)
+        removed = []
+        for day in plan.days:
+            if not day.hotel:
+                continue
+            if self._is_placeholder_or_missing_hotel(day.hotel):
+                removed.append(
+                    {
+                        "day_index": day.day_index,
+                        "hotel": day.hotel.name,
+                        "reason": "placeholder_or_missing_geo",
+                        "threshold_m": threshold,
+                    }
+                )
+                self._remove_transport_segments_for_hotel(day, day.hotel.name)
+                day.hotel = None
+                continue
+            if not day.hotel.location:
+                continue
+            distances = []
+            for attraction in day.attractions or []:
+                if not attraction.location:
+                    continue
+                distance, has_geo = self._estimate_distance(day.hotel.location, attraction.location)
+                if has_geo and math.isfinite(distance):
+                    distances.append(distance)
+            if not distances:
+                continue
+            min_distance = min(distances)
+            if min_distance <= threshold:
+                continue
+            removed.append(
+                {
+                    "day_index": day.day_index,
+                    "hotel": day.hotel.name,
+                    "nearest_attraction_distance_m": round(min_distance, 2),
+                    "threshold_m": threshold,
+                }
+            )
+            self._remove_transport_segments_for_hotel(day, day.hotel.name)
+            day.hotel = None
+        if not removed:
+            return plan, None
+        self._aggregate_budget(plan, form_snapshot.get("accommodation", "舒适型酒店"))
+        entry = {
+            "phase": "format_fix",
+            "timestamp": now_iso(),
+            "status": "fixed",
+            "notes": ["unsafe_hotel_removed"],
+            "removed_hotels": removed,
+            "retry_used": True,
+        }
+        log_event("unsafe_hotel_removed", entry)
+        return plan, entry
+
+    def _is_placeholder_or_missing_hotel(self, hotel: Hotel) -> bool:
+        name = str(hotel.name or "").strip().lower()
+        normalized_name = re.sub(r"\s+", "", name)
+        address = str(hotel.address or "").strip()
+        price_source = str(hotel.price_source or "").strip()
+        placeholder_names = {
+            "推荐酒店",
+            "推荐住宿",
+            "酒店",
+            "住宿",
+            "经济型酒店",
+            "舒适型酒店",
+            "recommendedhotel",
+            "recommended hotel",
+        }
+        if not normalized_name or normalized_name in placeholder_names:
+            return True
+        return not hotel.location and not address and price_source in {"llm_estimate", "estimate", ""}
+
+    def _remove_transport_segments_for_hotel(self, day: DayPlan, hotel_name: str) -> None:
+        normalized_hotel_name = str(hotel_name or "").strip()
+        if not normalized_hotel_name:
+            return
+        day.transport_segments = [
+            segment
+            for segment in (day.transport_segments or [])
+            if segment.from_name != normalized_hotel_name and segment.to_name != normalized_hotel_name
+        ]
+
     def _reflect_and_fix(self, plan: TripPlan, form_snapshot: Dict[str, Any]) -> Tuple[TripPlan, Dict[str, Any]]:
         notes = []
         expected_days = int(form_snapshot.get("travel_days", len(plan.days) or 1) or 1)
@@ -995,11 +1444,14 @@ class TripTaskExecutor:
             fallback = self.planner.create_fallback_plan(form_snapshot)
             plan.days = (plan.days + fallback.days)[:expected_days]
 
+        self._inherit_hotel_across_days(plan, notes)
+
         start_date = self._parse_date(form_snapshot.get("start_date"))
         for idx, day in enumerate(plan.days):
             day.day_index = idx
             if start_date:
                 day.date = (start_date + timedelta(days=idx)).strftime("%Y-%m-%d")
+            attraction_cap = self._intercity_day_attraction_cap(plan, idx)
             meal_types = {meal.type for meal in day.meals}
             for meal_type in ("breakfast", "lunch", "dinner"):
                 if meal_type not in meal_types:
@@ -1017,10 +1469,13 @@ class TripTaskExecutor:
                             flush=True,
                         )
                         day.meals.append(self._build_default_meal(form_snapshot.get("city", ""), meal_type))
-            if not day.attractions:
+            if not day.attractions and attraction_cap != 0:
                 notes.append(f"day_{idx}_missing_attractions")
                 print(f"INFO autofill attractions | day_index={idx} date={day.date}", flush=True)
                 day.attractions = self.planner.create_fallback_plan(form_snapshot).days[0].attractions
+            if attraction_cap is not None and attraction_cap >= 0 and len(day.attractions or []) > attraction_cap:
+                notes.append(f"day_{idx}_intercity_attraction_cap")
+                day.attractions = list(day.attractions or [])[:attraction_cap]
 
         if len(plan.weather_info) < expected_days:
             notes.append("weather_info_incomplete")
@@ -1044,7 +1499,22 @@ class TripTaskExecutor:
                     )
 
         self._aggregate_budget(plan, form_snapshot.get("accommodation", "舒适型酒店"))
-        return plan, {"timestamp": now_iso(), "status": "fixed" if notes else "ok", "notes": notes}
+        return plan, {"phase": "format_fix", "timestamp": now_iso(), "status": "fixed" if notes else "ok", "notes": notes}
+
+    def _inherit_hotel_across_days(self, plan: TripPlan, notes: List[str]) -> None:
+        primary_hotel = None
+        for day in plan.days:
+            if day.hotel and not self._is_placeholder_or_missing_hotel(day.hotel):
+                primary_hotel = day.hotel
+                break
+        if primary_hotel is None:
+            return
+        for day in plan.days:
+            if day.hotel:
+                continue
+            day.hotel = deepcopy(primary_hotel)
+            day.accommodation = primary_hotel.type or day.accommodation
+            notes.append(f"day_{day.day_index}_hotel_inherited")
 
     def _parse_date(self, value: Any):
         if not value:
@@ -1057,15 +1527,29 @@ class TripTaskExecutor:
     def _dict_to_request(self, form_snapshot: Dict[str, Any]) -> TripRequest:
         return TripRequest(
             nickname=form_snapshot.get("nickname", "User"),
+            departure_city=form_snapshot.get("departure_city", ""),
             city=form_snapshot.get("city", "北京"),
             start_date=form_snapshot.get("start_date", datetime.now().strftime("%Y-%m-%d")),
             end_date=form_snapshot.get("end_date", datetime.now().strftime("%Y-%m-%d")),
             travel_days=int(form_snapshot.get("travel_days", 1) or 1),
+            intercity_transportation=form_snapshot.get("intercity_transportation", "智能推荐"),
             transportation=form_snapshot.get("transportation", "公共交通"),
             accommodation=form_snapshot.get("accommodation", "舒适型酒店"),
             preferences=form_snapshot.get("preferences", []) or [],
             free_text_input=form_snapshot.get("free_text_input", ""),
         )
+
+    def _intercity_day_attraction_cap(self, plan: TripPlan, day_index: int) -> int | None:
+        intercity = getattr(plan, "intercity_transport", None)
+        constraints = getattr(intercity, "schedule_constraints", None) if intercity else None
+        if not isinstance(constraints, dict):
+            return None
+        last_index = max(len(plan.days) - 1, 0)
+        if day_index == 0 and constraints.get("first_day_max_attractions") is not None:
+            return int(constraints.get("first_day_max_attractions") or 0)
+        if day_index == last_index and constraints.get("last_day_max_attractions") is not None:
+            return int(constraints.get("last_day_max_attractions") or 0)
+        return None
 
     def _dict_to_plan(self, data: Dict[str, Any], form_snapshot: Dict[str, Any]) -> TripPlan:
         if data:
@@ -1082,6 +1566,7 @@ class TripTaskExecutor:
             "total_hotels": plan.budget.total_hotels if plan.budget else 0,
             "total_meals": plan.budget.total_meals if plan.budget else 0,
             "total_transportation": plan.budget.total_transportation if plan.budget else 0,
+            "total_intercity_transportation": plan.budget.total_intercity_transportation if plan.budget else 0,
             "total": plan.budget.total if plan.budget else 0,
         }
 
@@ -1093,7 +1578,7 @@ class TripTaskExecutor:
         user_message: str,
         assistant_message: str,
         update_mode: str,
-        reflection: Dict[str, Any] | None = None,
+        reflection: Dict[str, Any] | List[Dict[str, Any]] | None = None,
     ) -> None:
         conversation_log = list(task_record.get("conversation_log", []) or [])
         conversation_log.extend(
@@ -1107,14 +1592,15 @@ class TripTaskExecutor:
         task_record["form_snapshot"] = form_snapshot
         task_record["budget_ledger"] = self._build_budget_ledger(plan)
         if reflection is not None:
-            task_record["reflection_log"] = task_record.get("reflection_log", []) + [reflection]
+            reflection_entries = reflection if isinstance(reflection, list) else [reflection]
+            task_record["reflection_log"] = task_record.get("reflection_log", []) + reflection_entries
         task_record["conversation_log"] = conversation_log
         task_record["update_mode"] = update_mode
         task_record["city"] = plan.city
         task_record["date_range"] = f"{plan.start_date} to {plan.end_date}"
         task_record["travel_days"] = len(plan.days)
         with timed_event("chat.write_task", {"task_id": task_record["task_id"], "update_mode": update_mode}):
-            self.memory_store.write_task(task_record)
+            self._write_task_async_or_sync(task_record)
 
     def _answer_question(self, current_plan: TripPlan, user_message: str) -> str:
         fallback = "我可以继续帮你查看当前旅行计划，但这个问题在现有计划里没有足够信息。你可以再具体问某一天、某个景点、酒店、餐饮或预算。"
@@ -1168,6 +1654,13 @@ class TripTaskExecutor:
 
     def _start_user_profile_update(self, context: Dict[str, Any]) -> None:
         self.profile_executor.submit(self.user_profile_agent.update_profile, context)
+
+    def _write_task_async_or_sync(self, task_record: Dict[str, Any]) -> None:
+        writer = getattr(self.memory_store, "write_task_async", None)
+        if callable(writer):
+            writer(task_record)
+            return
+        self.memory_store.write_task(task_record)
 
     def _start_context_compression_if_needed(self, task_record: Dict[str, Any]) -> None:
         if not self.context_compressor.needs_heavy_refresh(task_record):

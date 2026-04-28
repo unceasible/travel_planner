@@ -148,8 +148,7 @@ class ConversationContextCompressor:
                     segment_summaries[index] = future.result()
 
             merged_summary = self._merge_segment_summaries(segment_summaries)
-            current = self.memory_store.read_task(task_id)
-            current["conversation_context"] = {
+            conversation_context = {
                 "cache_version": CONTEXT_CACHE_VERSION,
                 "mode": "heavy",
                 "created_at": now_iso(),
@@ -159,7 +158,12 @@ class ConversationContextCompressor:
                 "segment_count": len(segments),
                 "summary": merged_summary,
             }
-            self.memory_store.write_task(current)
+            if hasattr(self.memory_store, "patch_task_fields_async"):
+                self.memory_store.patch_task_fields_async(task_id, {"conversation_context": conversation_context})
+            else:
+                current = self.memory_store.read_task(task_id)
+                current["conversation_context"] = conversation_context
+                self.memory_store.write_task(current)
             log_event(
                 "context_compression_heavy_complete",
                 {
