@@ -16,7 +16,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="基于HelloAgents框架的智能旅行规划助手API",
+    description="多智能体协作的智能旅行规划助手API",
     docs_url="/docs",
     redoc_url="/redoc"
 )
