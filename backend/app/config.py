@@ -17,7 +17,7 @@ if helloagents_env.exists():
 
 
 class Settings(BaseSettings):
-    app_name: str = "HelloAgents智能旅行助手"
+    app_name: str = "智能旅行规划助手"
     app_version: str = "1.0.0"
     debug: bool = False
 

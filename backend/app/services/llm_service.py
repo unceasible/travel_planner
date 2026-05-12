@@ -1,4 +1,4 @@
-"""LLM service helpers for HelloAgents and OpenAI-compatible clients."""
+"""LLM service helpers for OpenAI-compatible clients."""
 # -*- coding: utf-8 -*-
 import os
 

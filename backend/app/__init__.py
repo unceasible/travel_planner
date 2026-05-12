@@ -1,4 +1,4 @@
-"""HelloAgents智能旅行助手 - 后端应用"""
+"""智能旅行规划助手 - 后端应用"""
 
 from .encoding import configure_utf8_stdio
 

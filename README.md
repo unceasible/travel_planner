@@ -1,12 +1,12 @@
-# HelloAgents 智能旅行助手
+# 智能旅行规划助手
 
-自研多智能体协作系统，采用异步并行流水线架构，集成高德地图、途牛票务与 Unsplash 等实时数据源，提供端到端的个性化旅行规划与多轮对话修改体验。LLM 接入与 MCP 工具管理借力 HelloAgents 的 `HelloAgentsLLM` 与 `MCPTool` 两个工具类。
+自研多智能体协作系统，采用异步并行流水线架构，集成高德地图、途牛票务与 Unsplash 等实时数据源，提供端到端的个性化旅行规划与多轮对话修改体验。
 
 ## 核心架构
 
 ### 多智能体协作
 
-系统由 **9 个智能体角色** 组成，分为三层：规划与检索层、质量保障层、对话感知层。所有智能体均为自研 Python 类，HelloAgents 仅提供 LLM 连接（`HelloAgentsLLM`）与 MCP 工具管理（`MCPTool`）两个基础设施类。
+系统由 **9 个智能体角色** 组成，分为三层：规划与检索层、质量保障层、对话感知层。所有智能体均为自研 Python 类。
 
 #### 智能体清单
 
@@ -105,7 +105,7 @@
 ## 技术栈
 
 ### 后端
-- **智能体框架**：自研多智能体编排 + HelloAgents 工具类（`HelloAgentsLLM` / `MCPTool`）
+- **智能体框架**：自研多智能体编排
 - **API 框架**：FastAPI + SSE 流式推送
 - **数据源**：高德地图 MCP、途牛酒店/机票/火车票 MCP、Unsplash 图片
 - **LLM**：OpenAI 兼容接口，支持主模型 + 廉价模型双配置
@@ -241,8 +241,6 @@ CC BY-NC-SA 4.0
 
 ## 致谢
 
-- [HelloAgents](https://github.com/datawhalechina/Hello-Agents) — 智能体教程
-- [HelloAgents 框架](https://github.com/jjyaoao/HelloAgents) — 智能体框架
 - [高德地图开放平台](https://lbs.amap.com/) — 地图服务
 - [途牛开放平台](https://open.tuniu.cn/) — 酒店与票务 MCP
 - [Unsplash](https://unsplash.com/developers) — 图片服务
